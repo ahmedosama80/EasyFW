@@ -1,0 +1,7 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    { "name": "EasyFW (demo, safe)", "type": "clr", "request": "launch", "preLaunchTask": "build", "program": "${workspaceFolder}/src/EasyFW/bin/Debug/EasyFW.exe", "args": ["--demo"], "cwd": "${workspaceFolder}" },
+    { "name": "EasyFW (monitor-only)", "type": "clr", "request": "launch", "preLaunchTask": "build", "program": "${workspaceFolder}/src/EasyFW/bin/Debug/EasyFW.exe", "args": ["--monitor-only"], "cwd": "${workspaceFolder}" }
+  ]
+}
