@@ -8,7 +8,7 @@ Nothing reaches the network until you approve it.
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)
 ![.NET Framework 4.8](https://img.shields.io/badge/.NET%20Framework-4.8-512BD4)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-2EA44F)
-![License](https://img.shields.io/badge/license-non--commercial-orange)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-orange)](LICENSE)
 
 ![EasyFW Connections tab](docs/images/connections.png)
 
@@ -161,6 +161,6 @@ The original request is in [docs/SPEC.md](docs/SPEC.md).
 
 ## License
 
-**This software is for non-commercial use only.**
+**This software is for non-commercial use only**, under the [PolyForm Noncommercial License 1.0.0](LICENSE).
 
 Developed by **Ahmed Osama Mohamed**. For a commercial license, contact [ahmed_osama@hotmail.com](mailto:ahmed_osama@hotmail.com).
