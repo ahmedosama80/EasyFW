@@ -21,7 +21,10 @@ namespace EasyFW.UI
             ("Dir", 44, ConnectionColumn.Direction, HorizontalAlignment.Left),
             ("Proto", 56, ConnectionColumn.Protocol, HorizontalAlignment.Left),
             ("Local IP", 118, ConnectionColumn.LocalIp, HorizontalAlignment.Left),
+            ("Local Host", 130, ConnectionColumn.LocalHost, HorizontalAlignment.Left),
             ("Remote IP", 124, ConnectionColumn.RemoteIp, HorizontalAlignment.Left),
+            ("Remote Host", 180, ConnectionColumn.RemoteHost, HorizontalAlignment.Left),
+            ("Country", 130, ConnectionColumn.Country, HorizontalAlignment.Left),
             ("Src Port", 62, ConnectionColumn.SourcePort, HorizontalAlignment.Right),
             ("Dest Port", 66, ConnectionColumn.DestPort, HorizontalAlignment.Right),
             ("State", 84, ConnectionColumn.State, HorizontalAlignment.Left),
@@ -54,6 +57,7 @@ namespace EasyFW.UI
         private bool _ascending;
         private long _shownVersion = -1;
         private bool _filterDirty = true;
+        private int _infoVersion = -1;
 
         public string Summary { get; private set; } = "";
 
@@ -68,6 +72,8 @@ namespace EasyFW.UI
             _list.RetrieveVirtualItem += OnRetrieveItem;
             _list.ColumnClick += (_, e) => SortBy(e.Column);
             _list.ContextMenuStrip = BuildMenu();
+            Flags.ShowInColumn(_list, Column(ConnectionColumn.Country), Column(ConnectionColumn.RemoteIp),
+                i => i < _rows.Count && _rows[i].Verdict == Verdict.Blocked ? Theme.BlockedRow : (Color?)null);
             UpdateHeaders();
 
             var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(4, 4, 4, 2), WrapContents = true };
@@ -101,6 +107,8 @@ namespace EasyFW.UI
             Controls.Add(_graph);
             Controls.Add(bar);
         }
+
+        private static int Column(ConnectionColumn c) => Array.FindIndex(Columns, x => x.Column == c);
 
         private static ComboBox Combo(params object[] items)
         {
@@ -211,6 +219,12 @@ namespace EasyFW.UI
         public void RefreshData()
         {
             var store = _service.Connections;
+            // Names and countries arrive in the background, and rows build their cells as they paint.
+            if (IpInfo.Version != _infoVersion)
+            {
+                _infoVersion = IpInfo.Version;
+                _list.Invalidate();
+            }
             if (_pause.Checked && !_filterDirty) return;
             if (!_filterDirty && store.Version == _shownVersion) return;
             _filterDirty = false;
@@ -246,7 +260,10 @@ namespace EasyFW.UI
             e.Direction == TrafficDirection.Inbound ? "In" : e.Direction == TrafficDirection.Outbound ? "Out" : "-",
             e.Protocol ?? "",
             e.LocalIp ?? "",
+            IpInfo.HostName(e.LocalIp),
             e.RemoteIp ?? "",
+            IpInfo.HostName(e.RemoteIp),
+            IpInfo.CountryText(e.RemoteIp),
             e.SourcePort == 0 ? "*" : e.SourcePort.ToString(),
             e.DestPort == 0 ? "*" : e.DestPort.ToString(),
             e.State ?? "",

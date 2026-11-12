@@ -13,7 +13,8 @@ namespace EasyFW.Core
             if (Direction == TrafficDirection.Inbound && !p.SawInbound) return false;
             if (Direction == TrafficDirection.Outbound && !p.SawOutbound) return false;
             if (!string.IsNullOrEmpty(Protocol) && !string.Equals(p.LastProtocol, Protocol, StringComparison.OrdinalIgnoreCase)) return false;
-            return TextFilter.MatchesAll(Text, p.DisplayName, p.AppPath, p.LastRemote, p.LastProtocol, p.LastSourcePort.ToString(), p.LastDestPort.ToString());
+            return TextFilter.MatchesAll(Text, p.DisplayName, p.AppPath, p.LastRemote, p.LastProtocol, p.LastSourcePort.ToString(), p.LastDestPort.ToString(),
+                IpInfo.HostName(p.LastRemoteIp, false), IpInfo.CountryText(p.LastRemoteIp));
         }
     }
 
@@ -29,7 +30,7 @@ namespace EasyFW.Core
             if (Action.HasValue && r.Action != Action.Value) return false;
             if (Direction.HasValue && !r.Covers(Direction.Value)) return false;
             if (Enabled.HasValue && r.Enabled != Enabled.Value) return false;
-            return TextFilter.MatchesAll(Text, r.DisplayName, r.AppPath, r.Notes, r.Ports);
+            return TextFilter.MatchesAll(Text, r.DisplayName, r.AppPath, r.Notes, r.Ports, r.NetworkText);
         }
     }
 

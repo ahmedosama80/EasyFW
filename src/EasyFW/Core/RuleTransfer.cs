@@ -77,11 +77,15 @@ namespace EasyFW.Core
             catch (FormatException ex) { throw Bad(number, ex.Message); }
             if (ports != null && AppPaths.Same(path, AppPaths.PingApp)) throw Bad(number, "pings don't use ports");
 
-            return new AppRule
+            var result = new AppRule
             {
                 AppPath = path, Action = rule.Action, Direction = rule.Direction, Enabled = rule.Enabled, Notes = rule.Notes, Ports = ports,
+                NoInternet = rule.NoInternet, Lan = rule.Lan, LanSubnets = rule.LanSubnets,
                 CreatedUtc = rule.CreatedUtc == default ? DateTime.UtcNow : rule.CreatedUtc
             };
+            try { result.NormalizeNetwork(); }
+            catch (FormatException ex) { throw Bad(number, ex.Message.TrimEnd('.')); }
+            return result;
         }
 
         private static InvalidDataException Bad(int number, string reason) =>

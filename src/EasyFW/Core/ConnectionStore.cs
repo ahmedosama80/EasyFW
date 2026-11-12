@@ -28,7 +28,7 @@ namespace EasyFW.Core
         public bool IsLoopback => IpText.IsLoopback(LocalIp) || IpText.IsLoopback(RemoteIp);
     }
 
-    public enum ConnectionColumn { Time, Status, Process, Pid, Direction, Protocol, LocalIp, RemoteIp, SourcePort, DestPort, State, Hits, Path }
+    public enum ConnectionColumn { Time, Status, Process, Pid, Direction, Protocol, LocalIp, LocalHost, RemoteIp, RemoteHost, Country, SourcePort, DestPort, State, Hits, Path }
 
     public sealed class ConnectionFilter
     {
@@ -51,6 +51,8 @@ namespace EasyFW.Core
 
         public long Version { get; private set; }
         public int Count => _entries.Count;
+        /// <summary>Counted at the same points as the graph. Clearing the history leaves these alone.</summary>
+        public FlowStats Flows { get; } = new FlowStats();
 
         /// <summary>Connections accepted and blocked since the last call. History clearing doesn't affect these.</summary>
         public (int Accepted, int Blocked) TakeCounts()
@@ -84,6 +86,7 @@ namespace EasyFW.Core
             entry.ProcessName = AppPaths.DisplayName(e.AppPath);
             entry.Direction = e.Direction;
             entry.Hits++;
+            Flows.Record(e.AppPath, entry.ProcessName, e.Direction, e.Protocol, e.RemoteIp, entry.DestPort, e.Verdict, e.TimeUtc);
             Version++;
             Trim();
         }
@@ -108,7 +111,12 @@ namespace EasyFW.Core
                     changed = true;
                 }
                 var verdict = PolledVerdict(a, entry.Verdict);
-                if (verdict == Verdict.Accepted && entry.Verdict != Verdict.Accepted) _acceptedCount++;
+                if (verdict == Verdict.Accepted && entry.Verdict != Verdict.Accepted)
+                {
+                    _acceptedCount++;
+                    var dest = a.Direction == TrafficDirection.Inbound ? a.LocalPort : a.RemotePort;
+                    Flows.Record(a.AppPath, a.ProcessName, a.Direction, a.Protocol, a.RemoteIp, dest, Verdict.Accepted, nowUtc);
+                }
                 if (!entry.IsActive || entry.State != a.State || entry.Verdict != verdict)
                 {
                     entry.LastSeenUtc = nowUtc;
@@ -171,6 +179,8 @@ namespace EasyFW.Core
                 if (!Contains(e.ProcessName, term) && !Contains(e.AppPath, term) && !Contains(e.LocalIp, term)
                     && !Contains(e.RemoteIp, term) && !Contains(e.Protocol, term) && !Contains(e.State, term)
                     && !Contains(e.Verdict.ToString(), term)
+                    && !Contains(IpInfo.HostName(e.LocalIp, false), term) && !Contains(IpInfo.HostName(e.RemoteIp, false), term)
+                    && !Contains(IpInfo.CountryText(e.RemoteIp), term)
                     && e.LocalPort.ToString() != term && e.RemotePort.ToString() != term && e.Pid.ToString() != term)
                     return false;
             }
@@ -203,6 +213,9 @@ namespace EasyFW.Core
                 case ConnectionColumn.Direction: return a.Direction.CompareTo(b.Direction);
                 case ConnectionColumn.Protocol: return string.CompareOrdinal(a.Protocol, b.Protocol);
                 case ConnectionColumn.LocalIp: return string.CompareOrdinal(IpText.SortKey(a.LocalIp), IpText.SortKey(b.LocalIp));
+                case ConnectionColumn.LocalHost: return string.Compare(IpInfo.HostName(a.LocalIp, false), IpInfo.HostName(b.LocalIp, false), StringComparison.OrdinalIgnoreCase);
+                case ConnectionColumn.RemoteHost: return string.Compare(IpInfo.HostName(a.RemoteIp, false), IpInfo.HostName(b.RemoteIp, false), StringComparison.OrdinalIgnoreCase);
+                case ConnectionColumn.Country: return string.Compare(IpInfo.CountryText(a.RemoteIp), IpInfo.CountryText(b.RemoteIp), StringComparison.OrdinalIgnoreCase);
                 case ConnectionColumn.SourcePort: return a.SourcePort.CompareTo(b.SourcePort);
                 case ConnectionColumn.RemoteIp: return string.CompareOrdinal(IpText.SortKey(a.RemoteIp), IpText.SortKey(b.RemoteIp));
                 case ConnectionColumn.DestPort: return a.DestPort.CompareTo(b.DestPort);

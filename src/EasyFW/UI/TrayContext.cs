@@ -276,6 +276,20 @@ namespace EasyFW.UI
                     "Exit EasyFW", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+            if (_service.IsEnabled && _service.CanEnforce)
+            {
+                _form.ShowConnections();
+                using var ask = new ExitChoiceForm();
+                ask.ShowDialog(_form);
+                if (ask.Choice == ExitChoice.Cancel) return;
+                if (ask.Choice == ExitChoice.KeepOn)
+                {
+                    // Protection stays recorded as on, so the next start checks the rules and carries on.
+                    Log.Write("Exited with protection left on.");
+                    ExitThread();
+                    return;
+                }
+            }
             if (_service.NeedsRestoreOnExit)
             {
                 // The window stays up with progress until Windows Firewall is back, then the app closes.

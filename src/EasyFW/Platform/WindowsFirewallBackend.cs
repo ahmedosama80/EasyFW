@@ -161,6 +161,7 @@ namespace EasyFW.Platform
             if (spec.IcmpTypes != null) rule.IcmpTypesAndCodes = spec.IcmpTypes;
             if (spec.LocalPorts != null) rule.LocalPorts = spec.LocalPorts;
             if (spec.RemotePorts != null) rule.RemotePorts = spec.RemotePorts;
+            if (spec.RemoteAddresses != null) rule.RemoteAddresses = spec.RemoteAddresses;
             rule.Direction = spec.Direction == TrafficDirection.Inbound ? DirIn : DirOut;
             rule.Action = spec.Allow ? ActionAllow : ActionBlock;
             rule.Profiles = AllProfiles;

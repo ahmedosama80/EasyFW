@@ -36,12 +36,12 @@ namespace EasyFW.Demo
             (@"C:\Windows\System32\svchost.exe", TrafficDirection.Outbound, "TCP", "13.107.4.50", 443)
         };
 
-        private readonly Func<string, TrafficDirection, int, Verdict> _evaluate;
+        private readonly Func<string, TrafficDirection, int, string, Verdict> _evaluate;
         private readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer { Interval = 1500 };
         private readonly Random _random = new Random(7);
         private Action<FirewallEvent> _sink;
 
-        public DemoTraffic(Func<string, TrafficDirection, int, Verdict> evaluate)
+        public DemoTraffic(Func<string, TrafficDirection, int, string, Verdict> evaluate)
         {
             _evaluate = evaluate;
             _timer.Tick += (_, __) => EmitOne();
@@ -58,18 +58,21 @@ namespace EasyFW.Demo
         public void EmitOne()
         {
             var app = Apps[_random.Next(Apps.Length)];
+            // An app listens on a fixed port and the caller's port changes, so incoming traffic has the app's port on this PC.
+            var inbound = app.Dir == TrafficDirection.Inbound;
+            var spare = 50000 + _random.Next(40);
             _sink?.Invoke(new FirewallEvent
             {
                 TimeUtc = DateTime.UtcNow,
-                Verdict = _evaluate(app.Path, app.Dir, app.Port),
+                Verdict = _evaluate(app.Path, app.Dir, app.Port, app.Remote),
                 Pid = 2000 + Array.IndexOf(Apps, app) * 412,
                 AppPath = app.Path,
                 Direction = app.Dir,
                 Protocol = app.Proto,
                 LocalIp = "192.168.1.20",
-                LocalPort = 50000 + _random.Next(40),
+                LocalPort = inbound ? app.Port : spare,
                 RemoteIp = app.Remote,
-                RemotePort = app.Port
+                RemotePort = inbound ? spare : app.Port
             });
         }
 

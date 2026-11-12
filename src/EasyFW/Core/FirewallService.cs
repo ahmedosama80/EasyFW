@@ -246,6 +246,7 @@ namespace EasyFW.Core
             if (string.IsNullOrEmpty(rule.AppPath)) throw new ArgumentException("An application is required.");
             rule.Ports = PortList.Normalize(rule.Ports);
             if (rule.HasPorts && AppPaths.Same(rule.AppPath, AppPaths.PingApp)) throw new ArgumentException("Pings don't use ports, so a ping rule can't be limited to certain ports.");
+            rule.NormalizeNetwork();
 
             // One rule per app: saving over another app's path replaces that rule.
             var replaced = Config.Rules.Where(r => r.Id == rule.Id || AppPaths.Same(r.AppPath, rule.AppPath)).ToList();
@@ -347,12 +348,13 @@ namespace EasyFW.Core
             if (!pending.SawInbound && !pending.SawOutbound) Config.Pending.Remove(pending);
         }
 
-        /// <summary>What the current policy does with an app's traffic on a port.</summary>
-        public Verdict Evaluate(string appPath, TrafficDirection direction, int port)
+        /// <summary>What the current policy does with an app's traffic on a port, to or from a remote address.</summary>
+        /// <param name="remoteIp">Null skips the internet and LAN limits.</param>
+        public Verdict Evaluate(string appPath, TrafficDirection direction, int port, string remoteIp = null)
         {
             if (!IsEnabled) return Verdict.Accepted;
             var rule = FindRule(appPath);
-            return rule != null && rule.Enabled && rule.Covers(direction) && rule.AllowsPort(port)
+            return rule != null && rule.Enabled && rule.Covers(direction) && rule.AllowsPort(port) && (remoteIp == null || rule.AllowsAddress(remoteIp))
                 ? Verdict.Accepted : Verdict.Blocked;
         }
 
@@ -367,7 +369,7 @@ namespace EasyFW.Core
                     && e.Pid != 0 && !string.IsNullOrEmpty(e.AppPath)
                     && !IpText.IsLoopback(e.LocalIp) && !IpText.IsLoopback(e.RemoteIp)
                     && !IsEssentialConnection(e)
-                    && Evaluate(e.AppPath, e.Direction, e.Direction == TrafficDirection.Inbound ? e.LocalPort : e.RemotePort) == Verdict.Blocked)
+                    && Evaluate(e.AppPath, e.Direction, e.Direction == TrafficDirection.Inbound ? e.LocalPort : e.RemotePort, e.RemoteIp) == Verdict.Blocked)
                 .ToList();
         }
 

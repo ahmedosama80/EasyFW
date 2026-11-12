@@ -17,7 +17,9 @@ namespace EasyFW.UI
         private readonly TabControl _tabs = new TabControl { Dock = DockStyle.Fill };
         private readonly TabPage _connectionsPage = new TabPage("Connections");
         private readonly TabPage _requestsPage = new TabPage("Rules && Requests");
+        private readonly TabPage _topPage = new TabPage("Top Connections");
         private readonly ConnectionsTab _connections;
+        private readonly TopTab _top;
         private readonly RulesTab _rules;
         private readonly PictureBox _shield = new PictureBox { SizeMode = PictureBoxSizeMode.Zoom, Size = new Size(36, 36), Margin = new Padding(10, 8, 8, 8) };
         private readonly Label _statusTitle = new Label { AutoSize = true, Font = Theme.Title, Margin = new Padding(0, 6, 0, 0) };
@@ -26,6 +28,8 @@ namespace EasyFW.UI
         private readonly Button _toggleButton = new Button { AutoSize = true, Padding = new Padding(10, 3, 10, 3), Margin = new Padding(6, 10, 6, 6) };
         private readonly Button _optionsButton = new Button { AutoSize = true, Text = "Options", Padding = new Padding(6, 3, 6, 3), Margin = new Padding(0, 10, 10, 6) };
         private readonly Button _aboutButton = new Button { AutoSize = true, Text = "About", Padding = new Padding(6, 3, 6, 3), Margin = new Padding(0, 10, 10, 6) };
+        private readonly Button _exitButton = new Button { AutoSize = true, Text = "Exit", Padding = new Padding(6, 3, 6, 3), Margin = new Padding(0, 10, 10, 6) };
+        private readonly Label _version = new Label { AutoSize = true, Text = "v" + AppInfo.Version, ForeColor = Theme.Muted, Margin = new Padding(8, 0, 0, 4) };
         private readonly ContextMenuStrip _optionsMenu = new ContextMenuStrip();
         private readonly ToolStripMenuItem _notifyItem = new ToolStripMenuItem("Notify about new apps") { CheckOnClick = true };
         private readonly ToolStripMenuItem _essentialsItem = new ToolStripMenuItem("Allow essential Windows networking") { CheckOnClick = true };
@@ -50,7 +54,7 @@ namespace EasyFW.UI
         {
             _service = service;
             _toggle = toggle;
-            Text = service.Mode == RunMode.Demo ? "EasyFW (demo)" : "EasyFW";
+            Text = $"EasyFW {AppInfo.Version}" + (service.Mode == RunMode.Demo ? " (demo)" : "");
             Font = Theme.Base;
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96, 96);
@@ -59,15 +63,20 @@ namespace EasyFW.UI
             StartPosition = FormStartPosition.CenterScreen;
             ShowInTaskbar = true;
 
+            IpInfo.LoadCountries();
             _connections = new ConnectionsTab(service, DecideAsync) { Dock = DockStyle.Fill };
             _rules = new RulesTab(service, DecideAsync) { Dock = DockStyle.Fill };
+            _top = new TopTab(service, DecideAsync) { Dock = DockStyle.Fill };
             _connectionsPage.Controls.Add(_connections);
             _requestsPage.Controls.Add(_rules);
+            _topPage.Controls.Add(_top);
             _tabs.TabPages.Add(_connectionsPage);
+            _tabs.TabPages.Add(_topPage);
             _tabs.TabPages.Add(_requestsPage);
             _tabs.SelectedIndexChanged += (_, __) => RefreshLive();
 
             var header = BuildHeader();
+            _exitButton.Click += (_, __) => exit();
             _banner.Controls.Add(_bannerText);
             _banner.Controls.Add(_bannerButton);
             _bannerButton.Click += (_, __) => _bannerAction?.Invoke();
@@ -88,24 +97,31 @@ namespace EasyFW.UI
             var grid = new TableLayoutPanel
             {
                 Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                ColumnCount = 5, RowCount = 1, BackColor = Theme.Header
+                ColumnCount = 6, RowCount = 1, BackColor = Theme.Header
             };
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            // The version sits under the shield, top left, so it shows inside the window and not only in the title bar.
+            var badge = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Margin = Padding.Empty };
+            badge.Controls.Add(_shield);
+            badge.Controls.Add(_version);
+            _shield.Margin = new Padding(10, 8, 8, 0);
             var text = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Margin = Padding.Empty };
             var titleRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty };
             titleRow.Controls.Add(_statusTitle);
             titleRow.Controls.Add(_licenseNote);
             text.Controls.Add(titleRow);
             text.Controls.Add(_statusDetail);
-            grid.Controls.Add(_shield, 0, 0);
+            grid.Controls.Add(badge, 0, 0);
             grid.Controls.Add(text, 1, 0);
             grid.Controls.Add(_toggleButton, 2, 0);
             grid.Controls.Add(_optionsButton, 3, 0);
             grid.Controls.Add(_aboutButton, 4, 0);
+            grid.Controls.Add(_exitButton, 5, 0);
             _aboutButton.Click += (_, __) =>
             {
                 using var about = new AboutForm();
@@ -206,6 +222,12 @@ namespace EasyFW.UI
             BringUp();
         }
 
+        public void ShowTop()
+        {
+            _tabs.SelectedTab = _topPage;
+            BringUp();
+        }
+
         public void ShowRequests()
         {
             _tabs.SelectedTab = _requestsPage;
@@ -256,6 +278,7 @@ namespace EasyFW.UI
             UpdateBanner();
             _rules.RefreshData();
             _connections.SetCanDecide(_service.CanChange);
+            _top.SetCanDecide(_service.CanChange);
         }
 
         private string ActivityDetail() => _service.Activity + ". This can take a couple of minutes.";
@@ -294,8 +317,14 @@ namespace EasyFW.UI
                 _connections.RefreshData();
                 _statusLabel.Text = _connections.Summary;
             }
+            else if (_tabs.SelectedTab == _topPage)
+            {
+                _top.RefreshData();
+                _statusLabel.Text = _top.Summary;
+            }
             else
             {
+                _rules.RefreshNames();
                 _statusLabel.Text = $"{_service.Config.Rules.Count} rule(s), {_service.PendingCount} pending";
             }
         }

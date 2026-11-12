@@ -13,8 +13,8 @@ namespace EasyFW.UI
     {
         private readonly FirewallService _service;
         private readonly Func<string, RuleAction, string, Task> _decide;
-        private readonly ListView _pending = NewList(("Application", 170), ("Wants", 72), ("Remote IP", 130), ("Src Port", 62), ("Dest Port", 66), ("Proto", 60), ("Attempts", 66), ("First seen", 130), ("Path", 360));
-        private readonly ListView _rules = NewList(("Application", 170), ("Decision", 110), ("Direction", 80), ("Ports", 130), ("Enabled", 62), ("Notes", 200), ("Created", 130), ("Path", 300));
+        private readonly ListView _pending = NewList(("Application", 170), ("Wants", 84), ("Remote IP", 130), ("Remote Host", 170), ("Country", 130), ("Src Port", 62), ("Dest Port", 66), ("Proto", 60), ("Attempts", 66), ("First seen", 130), ("Path", 360));
+        private readonly ListView _rules = NewList(("Application", 170), ("Decision", 110), ("Direction", 80), ("Ports", 130), ("Network", 150), ("Enabled", 62), ("Notes", 200), ("Created", 130), ("Path", 300));
         private readonly Button _accept = ActionButton("Accept Always");
         private readonly Button _block = ActionButton("Block Always");
         private readonly Button _acceptPorts = ActionButton("Accept on ports...");
@@ -39,6 +39,7 @@ namespace EasyFW.UI
         private const string NoPendingText = "No pending requests. When an unapproved app tries to connect, it appears here.";
         private const string NoRulesText = "No rules yet. Decide on a request above, or add one by hand.";
         private const string NoMatchText = "Nothing matches these filters.";
+        private int _infoVersion = -1;
 
         public RulesTab(FirewallService service, Func<string, RuleAction, string, Task> decide)
         {
@@ -73,6 +74,7 @@ namespace EasyFW.UI
             _delete.Click += async (_, __) => await DeleteSelected();
             _rules.DoubleClick += async (_, __) => await EditRule(SelectedRules().FirstOrDefault());
             _pending.ContextMenuStrip = BuildPendingMenu();
+            Flags.ShowInColumn(_pending, 4, 2);
             _pending.SelectedIndexChanged += (_, __) => UpdateButtons();
             _rules.SelectedIndexChanged += (_, __) => UpdateButtons();
             _pendingSearch.TextChanged += (_, __) => RefreshData();
@@ -261,8 +263,15 @@ namespace EasyFW.UI
             _delete.Enabled = can && _rules.SelectedItems.Count > 0;
         }
 
+        /// <summary>Host names and countries arrive in the background. Called every second while the tab shows.</summary>
+        public void RefreshNames()
+        {
+            if (IpInfo.Version != _infoVersion) RefreshData();
+        }
+
         public void RefreshData()
         {
+            _infoVersion = IpInfo.Version;
             var cfg = _service.Config;
             var pendingFilter = CurrentPendingFilter();
             var ruleFilter = CurrentRuleFilter();
@@ -275,13 +284,13 @@ namespace EasyFW.UI
 
             Rebuild(_pending, pending.OrderByDescending(p => p.LastSeenUtc), p => p.AppPath, p => new[]
             {
-                p.DisplayName, p.DirectionText, p.LastRemoteIp, PortText(p.LastSourcePort), PortText(p.LastDestPort), p.LastProtocol ?? "", p.Attempts.ToString(),
+                p.DisplayName, p.DirectionText, p.LastRemoteIp, IpInfo.HostName(p.LastRemoteIp), IpInfo.CountryText(p.LastRemoteIp), PortText(p.LastSourcePort), PortText(p.LastDestPort), p.LastProtocol ?? "", p.Attempts.ToString(),
                 p.FirstSeenUtc.ToLocalTime().ToString("g"), p.AppPath
             }, null);
             Rebuild(_rules, rules.OrderBy(r => r.DisplayName, StringComparer.OrdinalIgnoreCase), r => r.Id, r => new[]
             {
                 r.DisplayName, r.Action == RuleAction.Allow ? "Accept Always" : "Block Always",
-                r.Direction == RuleDirection.Both ? "In + Out" : r.Direction.ToString(), r.PortsText, r.Enabled ? "Yes" : "No",
+                r.Direction == RuleDirection.Both ? "In + Out" : r.Direction.ToString(), r.PortsText, r.NetworkText, r.Enabled ? "Yes" : "No",
                 r.Notes ?? "", r.CreatedUtc.ToLocalTime().ToString("g"), r.AppPath
             }, r => !r.Enabled ? Theme.Closed : r.Action == RuleAction.Block ? Theme.Blocked : Theme.Good);
 
@@ -331,6 +340,25 @@ namespace EasyFW.UI
         private readonly TextBox _notes = new TextBox { Dock = DockStyle.Fill };
         private readonly TextBox _ports = new TextBox { Dock = DockStyle.Fill };
         private readonly Label _portsHint = new Label { AutoSize = true, ForeColor = Theme.Muted, MaximumSize = new Size(440, 0), Margin = new Padding(3, 0, 3, 6) };
+        private readonly CheckBox _internet = new CheckBox { Text = "Allow internet access", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 3) };
+        private readonly RadioButton _lanAll = new RadioButton { Text = "All LAN", AutoSize = true, Checked = true };
+        private readonly RadioButton _lanSome = new RadioButton { Text = "Only these subnets", AutoSize = true };
+        private readonly RadioButton _lanNone = new RadioButton { Text = "No LAN", AutoSize = true };
+        private readonly CheckedListBox _subnets = new CheckedListBox { CheckOnClick = true, IntegralHeight = false, Size = new Size(420, 84), Margin = new Padding(3, 0, 3, 3) };
+        private readonly TextBox _newSubnet = new TextBox { Width = 170, Margin = new Padding(0, 3, 6, 3) };
+        private readonly Button _addSubnet = new Button { Text = "Add subnet", AutoSize = true, Margin = new Padding(0, 1, 0, 1) };
+        private readonly Label _networkHint = new Label
+        {
+            AutoSize = true, ForeColor = Theme.Muted, MaximumSize = new Size(440, 0), Margin = new Padding(3, 0, 3, 6),
+            Text = "LAN is private and link-local addresses (10.x, 172.16-31.x, 192.168.x), plus local broadcast and multicast so devices can find each other. Internet is every other address. Applies to Accept Always only."
+        };
+
+        private sealed class SubnetItem
+        {
+            public string Cidr;
+            public string Note;
+            public override string ToString() => string.IsNullOrEmpty(Note) ? Cidr : $"{Cidr}   ({Note})";
+        }
 
         public AppRule Result { get; private set; }
 
@@ -345,7 +373,7 @@ namespace EasyFW.UI
             ShowInTaskbar = false;
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96, 96);
-            ClientSize = new Size(560, 310);
+            ClientSize = new Size(580, 520);
 
             _direction.Items.AddRange(new object[] { "In + Out", "Outbound only", "Inbound only" });
             _direction.SelectedIndex = 0;
@@ -370,6 +398,9 @@ namespace EasyFW.UI
             AddRow(grid, "Direction", _direction);
             AddRow(grid, "Ports", _ports);
             AddRow(grid, "", _portsHint);
+            AddRow(grid, "Internet", _internet);
+            AddRow(grid, "LAN", NetworkChoices());
+            AddRow(grid, "", _networkHint);
             AddRow(grid, "", _enabled);
             AddRow(grid, "Notes", _notes);
 
@@ -394,14 +425,69 @@ namespace EasyFW.UI
                 _enabled.Checked = rule.Enabled;
                 _notes.Text = rule.Notes;
                 _ports.Text = rule.Ports;
+                _internet.Checked = !rule.NoInternet;
+                _lanSome.Checked = rule.Lan == LanAccess.Selected;
+                _lanNone.Checked = rule.Lan == LanAccess.None;
+                _lanAll.Checked = rule.Lan == LanAccess.All;
             }
+            FillSubnets(rule?.Lan == LanAccess.Selected ? rule.LanSubnets : null);
             _accept.CheckedChanged += (_, __) => UpdatePortsHint();
+            foreach (var r in new[] { _lanAll, _lanSome, _lanNone }) r.CheckedChanged += (_, __) => UpdateNetwork();
+            _addSubnet.Click += (_, __) => AddSubnet();
             UpdatePortsHint();
         }
 
-        private void UpdatePortsHint() => _portsHint.Text = _accept.Checked
-            ? "Empty means all ports. With ports, the app can use only those. Example: 80, 443, 8000-8100"
-            : "Empty means all ports are blocked. With ports, only those are blocked and the app can use all others.";
+        private Control NetworkChoices()
+        {
+            var choices = new FlowLayoutPanel { AutoSize = true, Margin = Padding.Empty, WrapContents = false };
+            choices.Controls.AddRange(new Control[] { _lanAll, _lanSome, _lanNone });
+            var add = new FlowLayoutPanel { AutoSize = true, Margin = Padding.Empty, WrapContents = false };
+            add.Controls.Add(_newSubnet);
+            add.Controls.Add(_addSubnet);
+            var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, AutoSize = true, Margin = Padding.Empty };
+            panel.Controls.Add(choices, 0, 0);
+            panel.Controls.Add(_subnets, 0, 1);
+            panel.Controls.Add(add, 0, 2);
+            return panel;
+        }
+
+        /// <summary>This PC's subnets, plus any the rule has that aren't connected right now, so they aren't lost on save.</summary>
+        private void FillSubnets(IEnumerable<string> chosen)
+        {
+            var wanted = new HashSet<string>(chosen ?? Enumerable.Empty<string>());
+            foreach (var (cidr, adapter) in NetRanges.LocalSubnets())
+                _subnets.Items.Add(new SubnetItem { Cidr = cidr, Note = adapter }, wanted.Remove(cidr));
+            foreach (var cidr in wanted)
+                _subnets.Items.Add(new SubnetItem { Cidr = cidr, Note = "not connected now" }, true);
+        }
+
+        private void AddSubnet()
+        {
+            if (!NetRanges.TryNormalize(_newSubnet.Text, out var cidr))
+            {
+                MessageBox.Show(this, "Enter a subnet like 192.168.1.0/24, or a single address like 192.168.1.20.", Text);
+                return;
+            }
+            var existing = _subnets.Items.Cast<SubnetItem>().ToList().FindIndex(i => i.Cidr == cidr);
+            if (existing >= 0) _subnets.SetItemChecked(existing, true);
+            else _subnets.Items.Add(new SubnetItem { Cidr = cidr, Note = "added" }, true);
+            _newSubnet.Clear();
+        }
+
+        private void UpdateNetwork()
+        {
+            var accept = _accept.Checked;
+            _internet.Enabled = _lanAll.Enabled = _lanSome.Enabled = _lanNone.Enabled = accept;
+            _subnets.Enabled = _newSubnet.Enabled = _addSubnet.Enabled = accept && _lanSome.Checked;
+        }
+
+        private void UpdatePortsHint()
+        {
+            _portsHint.Text = _accept.Checked
+                ? "Empty means all ports. With ports, the app can use only those. Example: 80, 443, 8000-8100"
+                : "Empty means all ports are blocked. With ports, only those are blocked and the app can use all others.";
+            UpdateNetwork();
+        }
 
         private static void AddRow(TableLayoutPanel grid, string label, Control control)
         {
@@ -448,6 +534,15 @@ namespace EasyFW.UI
             Result.Enabled = _enabled.Checked;
             Result.Notes = _notes.Text.Trim();
             Result.Ports = ports;
+            Result.NoInternet = !_internet.Checked;
+            Result.Lan = _lanSome.Checked ? LanAccess.Selected : _lanNone.Checked ? LanAccess.None : LanAccess.All;
+            Result.LanSubnets = _subnets.CheckedItems.Cast<SubnetItem>().Select(i => i.Cidr).ToList();
+            try { Result.NormalizeNetwork(); }
+            catch (FormatException ex)
+            {
+                MessageBox.Show(this, ex.Message, Text);
+                return;
+            }
             DialogResult = DialogResult.OK;
         }
     }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.Serialization;
 
 namespace EasyFW.Core
@@ -24,8 +25,49 @@ namespace EasyFW.Core
         [DataMember] public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
         /// <summary>Empty means all ports. With ports, Allow permits only those, and Block stops only those and permits the rest.</summary>
         [DataMember] public string Ports { get; set; }
+        /// <summary>Accept rules only. True keeps the app off the internet, so it can reach only the LAN choice below.</summary>
+        [DataMember] public bool NoInternet { get; set; }
+        /// <summary>Accept rules only. Rules saved before this existed read as All.</summary>
+        [DataMember] public LanAccess Lan { get; set; }
+        /// <summary>Used when <see cref="Lan"/> is Selected, in a.b.c.d/n form.</summary>
+        [DataMember] public List<string> LanSubnets { get; set; }
 
         public string DisplayName => AppPaths.DisplayName(AppPath);
+
+        public bool LimitsNetwork => Action == RuleAction.Allow && (NoInternet || Lan != LanAccess.All);
+
+        /// <summary>Remote addresses for the Windows Firewall rules. Null means any.</summary>
+        public string RemoteAddresses => LimitsNetwork ? NetRanges.ForWindows(!NoInternet, Lan, LanSubnets) : null;
+
+        public bool AllowsAddress(string ip) => !LimitsNetwork || NetRanges.Allows(!NoInternet, Lan, LanSubnets, ip);
+
+        public string NetworkText
+        {
+            get
+            {
+                if (Action == RuleAction.Block) return "-";
+                var subnets = string.Join(", ", LanSubnets ?? new List<string>());
+                if (NoInternet) return Lan == LanAccess.All ? "LAN only" : Lan == LanAccess.Selected ? "Only " + subnets : "None";
+                return Lan == LanAccess.All ? "Internet + LAN" : Lan == LanAccess.Selected ? "Internet + " + subnets : "Internet only";
+            }
+        }
+
+        /// <summary>Tidies the network choices. They only mean something on an accept rule, so a block rule has them cleared.</summary>
+        /// <exception cref="FormatException">The choices aren't usable. The message says why.</exception>
+        public void NormalizeNetwork()
+        {
+            if (!Enum.IsDefined(typeof(LanAccess), Lan)) throw new FormatException("The LAN choice isn't valid.");
+            if (Action == RuleAction.Block)
+            {
+                NoInternet = false;
+                Lan = LanAccess.All;
+                LanSubnets = null;
+                return;
+            }
+            LanSubnets = Lan == LanAccess.Selected ? NetRanges.NormalizeSubnets(LanSubnets) : null;
+            if (Lan == LanAccess.Selected && LanSubnets.Count == 0) throw new FormatException("Choose at least one LAN subnet, or allow all of the LAN.");
+            if (NoInternet && Lan == LanAccess.None) throw new FormatException("With no internet and no LAN, the app couldn't use the network at all. Use Block Always instead.");
+        }
 
         public bool HasPorts => !string.IsNullOrEmpty(Ports);
 
@@ -44,7 +86,12 @@ namespace EasyFW.Core
             || (d == TrafficDirection.Outbound && Direction == RuleDirection.Outbound)
             || (d == TrafficDirection.Inbound && Direction == RuleDirection.Inbound);
 
-        public AppRule Clone() => (AppRule)MemberwiseClone();
+        public AppRule Clone()
+        {
+            var copy = (AppRule)MemberwiseClone();
+            copy.LanSubnets = LanSubnets?.ToList();
+            return copy;
+        }
     }
 
     [DataContract]
@@ -169,6 +216,8 @@ namespace EasyFW.Core
         public int Protocol { get; set; } = FirewallProtocols.Any;
         public string LocalPorts { get; set; }
         public string RemotePorts { get; set; }
+        /// <summary>Null means any address.</summary>
+        public string RemoteAddresses { get; set; }
         public string IcmpTypes { get; set; }
     }
 

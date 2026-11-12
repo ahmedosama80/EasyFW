@@ -50,6 +50,8 @@ namespace EasyFW.Core
         public const string NonCommercial = "THIS IS FOR NON-COMMERCIAL USE ONLY";
         public const string Developer = "Ahmed Osama Mohamed";
         public const string Email = "ahmed_osama@hotmail.com";
+        /// <summary>From the build, as major.minor.patch. The informational version can carry a commit hash, so it isn't used.</summary>
+        public static readonly string Version = typeof(AppInfo).Assembly.GetName().Version.ToString(3);
         public const string Brief = "A simple firewall built on Windows Firewall. It blocks all network traffic until you approve each app, on all ports or only the ones you choose, and shows live connections.";
     }
 

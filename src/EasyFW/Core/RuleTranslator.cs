@@ -45,7 +45,8 @@ namespace EasyFW.Core
                         Description = Describe(rule),
                         AppPath = rule.AppPath,
                         Direction = d,
-                        Allow = allow || rule.HasPorts
+                        Allow = allow || rule.HasPorts,
+                        RemoteAddresses = rule.RemoteAddresses
                     };
                 }
             }
@@ -55,7 +56,8 @@ namespace EasyFW.Core
             $"EasyFW: {rule.DisplayName} {Tag(rule)} {(d == TrafficDirection.Outbound ? "Out" : "In")}";
 
         private static string Describe(AppRule rule) =>
-            (rule.Action == RuleAction.Allow ? "Accept Always: " : "Block Always: ") + rule.AppPath + (rule.HasPorts ? ", ports: " + rule.PortsText : "");
+            (rule.Action == RuleAction.Allow ? "Accept Always: " : "Block Always: ") + rule.AppPath + (rule.HasPorts ? ", ports: " + rule.PortsText : "")
+            + (rule.LimitsNetwork ? ", network: " + rule.NetworkText : "");
 
         /// <summary>A port belongs to the far end when going out and to this PC when coming in. Windows needs one rule per protocol.</summary>
         private static FirewallRuleSpec PortRule(AppRule rule, TrafficDirection d, int protocol, string protocolName) =>
@@ -68,7 +70,9 @@ namespace EasyFW.Core
                 Allow = rule.Action == RuleAction.Allow,
                 Protocol = protocol,
                 RemotePorts = d == TrafficDirection.Outbound ? rule.Ports : null,
-                LocalPorts = d == TrafficDirection.Inbound ? rule.Ports : null
+                LocalPorts = d == TrafficDirection.Inbound ? rule.Ports : null,
+                // Only accept rules limit addresses, so the ports of a block rule stay shut to everyone.
+                RemoteAddresses = rule.RemoteAddresses
             };
 
         private static FirewallRuleSpec PingRule(AppRule rule, TrafficDirection d, int protocol, string types, string version) =>
@@ -79,7 +83,8 @@ namespace EasyFW.Core
                 Direction = d,
                 Allow = rule.Action == RuleAction.Allow,
                 Protocol = protocol,
-                IcmpTypes = types
+                IcmpTypes = types,
+                RemoteAddresses = rule.RemoteAddresses
             };
 
         /// <summary>
