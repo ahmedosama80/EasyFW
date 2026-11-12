@@ -48,7 +48,8 @@ namespace EasyFW.UI
         private long _shownMinute;
         private int _infoVersion = -1;
         private readonly CheckBox _hideLoopback = new CheckBox { Text = "Hide loopback", AutoSize = true, Checked = true, Margin = new Padding(0, 7, 10, 4) };
-        private readonly Button _reset = new Button { Text = "Reset counts", AutoSize = true, Margin = new Padding(0, 3, 4, 3) };
+        private readonly CheckBox _pause = UiHelpers.PauseButton();
+        private readonly Button _reset =new Button { Text = "Reset counts", AutoSize = true, Margin = new Padding(0, 3, 4, 3) };
         private readonly ToolStripMenuItem _acceptItem = new ToolStripMenuItem("Accept Always");
         private readonly ToolStripMenuItem _blockItem = new ToolStripMenuItem("Block Always");
         private readonly ToolStripMenuItem _copyItem = new ToolStripMenuItem("Copy row");
@@ -83,6 +84,7 @@ namespace EasyFW.UI
             bar.Controls.Add(UiHelpers.BarLabel("Rank by"));
             bar.Controls.Add(_rank);
             bar.Controls.Add(_hideLoopback);
+            bar.Controls.Add(_pause);
             bar.Controls.Add(_reset);
 
             var note = new Label
@@ -95,6 +97,7 @@ namespace EasyFW.UI
             foreach (var combo in new[] { _period, _status, _direction, _protocol, _rank })
                 combo.SelectedIndexChanged += (_, __) => FilterChanged();
             _hideLoopback.CheckedChanged += (_, __) => FilterChanged();
+            _pause.CheckedChanged += (_, __) => FilterChanged();
             _reset.Click += (_, __) =>
             {
                 _service.Connections.Flows.Clear();
@@ -181,6 +184,7 @@ namespace EasyFW.UI
             }
             // A new minute moves the period along, so old counts drop out even with no new traffic.
             var minute = FlowStats.MinuteOf(now);
+            if (_pause.Checked && !_filterDirty) return;
             if (!_filterDirty && flows.Version == _shownVersion && minute == _shownMinute) return;
             _filterDirty = false;
             _shownVersion = flows.Version;
@@ -204,6 +208,7 @@ namespace EasyFW.UI
             Summary = matching > _rows.Count
                 ? $"Top {_rows.Count} of {matching} connection groups in {span}"
                 : $"{_rows.Count} connection group(s) in {span}";
+            if (_pause.Checked) Summary += " (paused)";
         }
 
         private static string[] Cells(FlowStat f, int index) => new[]

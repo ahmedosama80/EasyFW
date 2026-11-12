@@ -44,7 +44,7 @@ namespace EasyFW.UI
         private readonly ComboBox _protocol = Combo("All", "TCP", "UDP", "ICMP", "ICMPv6");
         private readonly CheckBox _activeOnly = new CheckBox { Text = "Active only", AutoSize = true, Margin = new Padding(4, 7, 10, 4) };
         private readonly CheckBox _hideLoopback = new CheckBox { Text = "Hide loopback", AutoSize = true, Checked = true, Margin = new Padding(0, 7, 10, 4) };
-        private readonly CheckBox _pause = new CheckBox { Text = "Pause", AutoSize = true, Margin = new Padding(0, 7, 10, 4) };
+        private readonly CheckBox _pause = UiHelpers.PauseButton();
         private readonly Button _clear = new Button { Text = "Clear history", AutoSize = true, Margin = new Padding(0, 3, 4, 3) };
         private readonly TrafficGraph _graph;
         private readonly ToolStripMenuItem _acceptItem = new ToolStripMenuItem("Accept Always");
@@ -319,6 +319,14 @@ namespace EasyFW.UI
                 Log.Write("Copy failed: " + ex.Message);
                 MessageBox.Show(owner, "Another program is using the clipboard. Try again in a moment.", "Copy");
             }
+        }
+
+        /// <summary>A push button that stays down while the list is paused, so it's plain whether updates are stopped.</summary>
+        public static CheckBox PauseButton()
+        {
+            var button = new CheckBox { Appearance = Appearance.Button, Text = "Pause updates", AutoSize = true, TextAlign = System.Drawing.ContentAlignment.MiddleCenter, Margin = new Padding(0, 3, 6, 3) };
+            button.CheckedChanged += (_, __) => button.Text = button.Checked ? "Resume updates" : "Pause updates";
+            return button;
         }
 
         public static Label BarLabel(string text) =>

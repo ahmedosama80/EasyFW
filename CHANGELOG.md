@@ -15,6 +15,7 @@
 ### Changed
 
 - The rules list has a **Network** column.
+- **Pause updates** is a button on Connections, and Top Connections has one too. It stays pressed while the list is paused.
 - Open connections that break a rule's internet or LAN limits are closed, the same way as connections on a blocked port.
 - The About box credits DB-IP and the flag icons. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
