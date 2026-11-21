@@ -31,8 +31,77 @@ namespace EasyFW.Core
         [DataMember] public LanAccess Lan { get; set; }
         /// <summary>Used when <see cref="Lan"/> is Selected, in a.b.c.d/n form.</summary>
         [DataMember] public List<string> LanSubnets { get; set; }
+        /// <summary>A rule for a while: it's deleted at this time. Null keeps it.</summary>
+        [DataMember] public DateTime? ExpiresUtc { get; set; }
+        /// <summary>A rule until Windows restarts: the time Windows had started when the rule was made. Null keeps it across restarts.</summary>
+        [DataMember] public DateTime? BootUtc { get; set; }
+        /// <summary>Accept rules only: the app keeps working during a lockdown.</summary>
+        [DataMember] public bool KeepInLockdown { get; set; }
+        /// <summary>Accept rules only. Days the app may connect, bit 0 = Sunday. 0 means any time, with no schedule.</summary>
+        [DataMember] public int ScheduleDays { get; set; }
+        /// <summary>Minutes after midnight. A "to" at or before "from" runs past midnight into the next day.</summary>
+        [DataMember] public int ScheduleFrom { get; set; }
+        [DataMember] public int ScheduleTo { get; set; }
+
+        /// <summary>Lets traffic through: an accept rule, or a block rule on some ports, which opens the rest.</summary>
+        public bool Opens => Action == RuleAction.Allow || HasPorts;
+
+        public bool HasSchedule => ScheduleDays != 0;
+
+        /// <param name="local">Local time.</param>
+        public bool InSchedule(DateTime local)
+        {
+            if (!HasSchedule) return true;
+            var minute = local.Hour * 60 + local.Minute;
+            bool On(DayOfWeek d) => (ScheduleDays & (1 << (int)d)) != 0;
+            if (ScheduleFrom < ScheduleTo) return On(local.DayOfWeek) && minute >= ScheduleFrom && minute < ScheduleTo;
+            // Past midnight: the evening part belongs to the day it starts, the early morning part to the day before.
+            return On(local.DayOfWeek) && minute >= ScheduleFrom || On(local.AddDays(-1).DayOfWeek) && minute < ScheduleTo;
+        }
+
+        public string ScheduleText
+        {
+            get
+            {
+                if (!HasSchedule) return "Any time";
+                var days = new[] { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday, DayOfWeek.Saturday, DayOfWeek.Sunday }
+                    .Where(d => (ScheduleDays & (1 << (int)d)) != 0).ToList();
+                var dayText = days.Count == 7 ? "Every day"
+                    : ScheduleDays == 0b0111110 ? "Mon-Fri"
+                    : ScheduleDays == 0b1000001 ? "Sat-Sun"
+                    : string.Join(" ", days.Select(d => d.ToString().Substring(0, 3)));
+                return $"{dayText} {Clock(ScheduleFrom)}-{Clock(ScheduleTo)}";
+            }
+        }
+
+        private static string Clock(int minutes) => $"{minutes / 60 % 24:00}:{minutes % 60:00}";
 
         public string DisplayName => AppPaths.DisplayName(AppPath);
+
+        public bool IsTemporary => ExpiresUtc != null || BootUtc != null;
+
+        /// <summary>Sets how long the rule lasts, from now.</summary>
+        public void SetDuration(RuleDuration duration, DateTime nowUtc, DateTime bootUtc)
+        {
+            ExpiresUtc = RuleDurations.Length(duration) is TimeSpan length ? nowUtc + length : (DateTime?)null;
+            BootUtc = duration == RuleDuration.UntilRestart ? bootUtc : (DateTime?)null;
+        }
+
+        /// <summary>A rule ends at its time, or once Windows has restarted. Boot times a minute or two apart are the same boot, since the clock can be adjusted.</summary>
+        public bool HasExpired(DateTime nowUtc, DateTime bootUtc) =>
+            ExpiresUtc != null && nowUtc >= ExpiresUtc.Value
+            || BootUtc != null && Math.Abs((bootUtc - BootUtc.Value).TotalMinutes) > 2;
+
+        public string ExpiresText(DateTime nowUtc)
+        {
+            if (ExpiresUtc is DateTime end)
+            {
+                var left = end - nowUtc;
+                var at = end.ToLocalTime().ToString("HH:mm");
+                return left.TotalSeconds <= 0 ? "Ending" : left.TotalMinutes < 1 ? $"In under a minute ({at})" : $"In {Math.Ceiling(left.TotalMinutes):0} min ({at})";
+            }
+            return BootUtc != null ? "At restart" : "Never";
+        }
 
         public bool LimitsNetwork => Action == RuleAction.Allow && (NoInternet || Lan != LanAccess.All);
 
@@ -91,6 +160,78 @@ namespace EasyFW.Core
             var copy = (AppRule)MemberwiseClone();
             copy.LanSubnets = LanSubnets?.ToList();
             return copy;
+        }
+    }
+
+    /// <summary>
+    /// A rule for every app whose path matches: C:\Games\*.* for a folder and its subfolders, *\steam*.exe with wildcards,
+    /// or a plain keyword such as steam, which matches anywhere in the path. When a matching app with no rule of its own
+    /// tries to connect, EasyFW gives it a normal rule with this decision.
+    /// </summary>
+    [DataContract]
+    public sealed class PatternRule
+    {
+        [DataMember] public string Id { get; set; } = Guid.NewGuid().ToString("N").Substring(0, 8);
+        [DataMember] public string Pattern { get; set; }
+        [DataMember] public RuleAction Action { get; set; }
+        [DataMember] public bool Enabled { get; set; } = true;
+        [DataMember] public string Notes { get; set; }
+        [DataMember] public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
+
+        private string _compiledFor;
+        private System.Text.RegularExpressions.Regex _regex;
+
+        /// <summary>Without a backslash, * or ?, the pattern is a keyword.</summary>
+        public bool IsKeyword => IsKeywordText(Pattern);
+
+        public static bool IsKeywordText(string pattern) => (pattern ?? "").IndexOfAny(new[] { '\\', '*', '?', '/' }) < 0;
+
+        public string KindText => IsKeyword ? "Keyword" : "Path pattern";
+
+        /// <summary>System and Ping aren't files, so patterns never cover them.</summary>
+        public bool Matches(string appPath)
+        {
+            var p = (Pattern ?? "").Trim();
+            if (p.Length == 0 || string.IsNullOrEmpty(appPath) || AppPaths.IsPseudoApp(appPath)) return false;
+            if (IsKeywordText(p)) return appPath.IndexOf(p, StringComparison.OrdinalIgnoreCase) >= 0;
+            if (_compiledFor != p)
+            {
+                // * is any text, across folders too, so C:\Games\*.* covers subfolders. *.* also matches a name with no dot.
+                var body = System.Text.RegularExpressions.Regex.Escape(Environment.ExpandEnvironmentVariables(p.Replace('/', '\\')))
+                    .Replace(@"\*\.\*", ".*").Replace(@"\*", ".*").Replace(@"\?", ".");
+                _regex = new System.Text.RegularExpressions.Regex("^" + body + "$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+                _compiledFor = p;
+            }
+            return _regex.IsMatch(Environment.ExpandEnvironmentVariables(appPath));
+        }
+
+        public PatternRule Clone() => new PatternRule { Id = Id, Pattern = Pattern, Action = Action, Enabled = Enabled, Notes = Notes, CreatedUtc = CreatedUtc };
+    }
+
+    public enum RuleDuration { Forever, UntilRestart, Minutes10, Minutes30, Hour1 }
+
+    public static class RuleDurations
+    {
+        public static readonly RuleDuration[] All = { RuleDuration.Forever, RuleDuration.UntilRestart, RuleDuration.Minutes10, RuleDuration.Minutes30, RuleDuration.Hour1 };
+
+        public static TimeSpan? Length(RuleDuration d) =>
+            d == RuleDuration.Minutes10 ? TimeSpan.FromMinutes(10)
+            : d == RuleDuration.Minutes30 ? TimeSpan.FromMinutes(30)
+            : d == RuleDuration.Hour1 ? TimeSpan.FromHours(1)
+            : (TimeSpan?)null;
+
+        /// <summary>For lists: "Forever", "Until restart", "For 10 minutes".</summary>
+        public static string Text(RuleDuration d) =>
+            d == RuleDuration.Forever ? "Forever" : d == RuleDuration.UntilRestart ? "Until restart"
+            : d == RuleDuration.Minutes10 ? "For 10 minutes" : d == RuleDuration.Minutes30 ? "For 30 minutes" : "For 1 hour";
+
+        /// <summary>For buttons: "Accept Always", "Accept until restart", "Accept for 10 min".</summary>
+        public static string ActionText(RuleAction action, RuleDuration d)
+        {
+            var verb = action == RuleAction.Allow ? "Accept" : "Block";
+            return d == RuleDuration.Forever ? verb + " Always" : d == RuleDuration.UntilRestart ? verb + " until restart"
+                : d == RuleDuration.Minutes10 ? verb + " for 10 min" : d == RuleDuration.Minutes30 ? verb + " for 30 min" : verb + " for 1 hour";
         }
     }
 
@@ -154,6 +295,16 @@ namespace EasyFW.Core
         };
     }
 
+    /// <summary>How the user arranged one list's columns. Both arrays are by column, in the list's own column order.</summary>
+    [DataContract]
+    public sealed class ColumnLayout
+    {
+        [DataMember] public string List { get; set; }
+        /// <summary>Where each column is shown, left to right from 0.</summary>
+        [DataMember] public int[] Order { get; set; }
+        [DataMember] public int[] Widths { get; set; }
+    }
+
     [DataContract]
     public sealed class AppConfig
     {
@@ -165,12 +316,49 @@ namespace EasyFW.Core
         [DataMember] public List<AppRule> Rules { get; set; } = new List<AppRule>();
         [DataMember] public List<PendingRequest> Pending { get; set; } = new List<PendingRequest>();
         [DataMember] public WindowsSnapshot Snapshot { get; set; }
+        /// <summary>Wildcard and keyword rules, which decide for apps that have no rule of their own.</summary>
+        [DataMember] public List<PatternRule> Patterns { get; set; } = new List<PatternRule>();
+        /// <summary>Apps seen connecting, or trying to connect, to an internet address. Rule targets, as in <see cref="AppRule.AppPath"/>.</summary>
+        [DataMember] public List<string> InternetApps { get; set; } = new List<string>();
+        /// <summary>Column order and widths the user chose, per list.</summary>
+        [DataMember] public List<ColumnLayout> Columns { get; set; } = new List<ColumnLayout>();
+        /// <summary>Country the world map draws this PC in. Null means the Windows region.</summary>
+        [DataMember] public string MapHome { get; set; }
+        /// <summary>City within <see cref="MapHome"/>, or null for the middle of the country.</summary>
+        [DataMember] public string MapCity { get; set; }
+        /// <summary>Off by default: EasyFW asks a public service for this PC's internet address.</summary>
+        [DataMember] public bool NoPublicIpLookup { get; set; }
+        /// <summary>Whether EasyFW updates itself from GitHub. Asked once.</summary>
+        [DataMember] public UpdateChoice Updates { get; set; }
+        [DataMember] public DateTime? LastUpdateCheckUtc { get; set; }
+        /// <summary>Two-letter codes. All traffic to and from these countries is blocked, for every app.</summary>
+        [DataMember] public List<string> BlockedCountries { get; set; } = new List<string>();
+        /// <summary>Only accept rules marked to keep working stay in force.</summary>
+        [DataMember] public bool Lockdown { get; set; }
+        /// <summary>Salted hash of the password that guards changes. Null means none.</summary>
+        [DataMember] public string PasswordHash { get; set; }
+        [DataMember] public bool NoFloodAlerts { get; set; }
+        /// <summary>Ids of the blocklists in use. Empty means none.</summary>
+        [DataMember] public List<string> Blocklists { get; set; } = new List<string>();
+        /// <summary>Addresses or CIDRs never blocked by a blocklist.</summary>
+        [DataMember] public List<string> BlocklistExceptions { get; set; } = new List<string>();
+        [DataMember] public DateTime? BlocklistsUpdatedUtc { get; set; }
+
+        /// <summary>EasyFW connects out itself for the public IP and for updates.</summary>
+        public bool NeedsOwnConnection => !NoPublicIpLookup || Updates == UpdateChoice.Auto || (Blocklists?.Count ?? 0) > 0;
+
+        public ColumnLayout ColumnsFor(string list) => (Columns ?? new List<ColumnLayout>()).FirstOrDefault(c => c.List == list);
 
         /// <summary>The serializer skips constructors, so missing lists arrive as null.</summary>
         public void Normalize()
         {
             Rules ??= new List<AppRule>();
+            BlockedCountries ??= new List<string>();
+            Blocklists ??= new List<string>();
+            BlocklistExceptions ??= new List<string>();
             Pending ??= new List<PendingRequest>();
+            Patterns ??= new List<PatternRule>();
+            InternetApps ??= new List<string>();
             if (Snapshot != null) Snapshot.DisabledRuleKeys ??= new List<string>();
         }
     }

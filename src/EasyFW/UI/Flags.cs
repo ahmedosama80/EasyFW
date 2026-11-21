@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using System.Windows.Forms;
 using EasyFW.Core;
 
@@ -84,17 +85,24 @@ namespace EasyFW.UI
             list.DrawItem += (_, e) => { };
             list.DrawSubItem += (_, e) =>
             {
-                if (e.Item == null || e.ColumnIndex == 0)
+                if (e.Item == null || (e.ColumnIndex == 0 && list.Columns[0].DisplayIndex == 0))
                 {
                     e.DrawDefault = true;
                     return;
                 }
+                // The first column's bounds cover the whole row. Once the user has moved it, work out where it sits now.
+                var bounds = e.Bounds;
+                if (e.ColumnIndex == 0)
+                {
+                    var left = list.Columns.Cast<ColumnHeader>().Where(c => c.DisplayIndex < list.Columns[0].DisplayIndex).Sum(c => c.Width);
+                    bounds = new Rectangle(e.Item.Bounds.X + left, e.Bounds.Y, list.Columns[0].Width, e.Bounds.Height);
+                }
                 var selected = e.Item.Selected;
                 var back = selected ? (list.Focused ? SystemColors.Highlight : SystemColors.Control) : rowBack?.Invoke(e.ItemIndex) ?? e.Item.BackColor;
                 var fore = selected && list.Focused ? SystemColors.HighlightText : e.Item.ForeColor;
-                using (var brush = new SolidBrush(back)) e.Graphics.FillRectangle(brush, e.Bounds);
+                using (var brush = new SolidBrush(back)) e.Graphics.FillRectangle(brush, bounds);
                 var text = e.SubItem?.Text ?? "";
-                var textBounds = e.Bounds;
+                var textBounds = bounds;
                 textBounds.X += 6;
                 textBounds.Width -= 12;
                 var align = TextFormatFlags.Left;

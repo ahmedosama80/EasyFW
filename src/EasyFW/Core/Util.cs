@@ -79,6 +79,19 @@ namespace EasyFW.Core
     }
 
     /// <summary>Minimal log for faults the UI can't show. Never throws.</summary>
+    public static class SystemBoot
+    {
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern ulong GetTickCount64();
+
+        /// <summary>When Windows last started, to the second.</summary>
+        public static DateTime Utc()
+        {
+            var boot = DateTime.UtcNow - TimeSpan.FromMilliseconds(GetTickCount64());
+            return new DateTime(boot.Ticks - boot.Ticks % TimeSpan.TicksPerSecond, DateTimeKind.Utc);
+        }
+    }
+
     public static class Log
     {
         private static readonly object Gate = new object();

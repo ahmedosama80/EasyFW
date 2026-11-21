@@ -126,6 +126,56 @@ namespace EasyFW.Core
         }
 
         private static int Compare(ulong ah, ulong al, ulong bh, ulong bl) => ah != bh ? ah.CompareTo(bh) : al.CompareTo(bl);
+
+        /// <summary>Every address range of a country, neighbours joined, as Windows Firewall writes them: "first-last" or one address.</summary>
+        public List<string> Ranges(string code)
+        {
+            var result = new List<string>();
+            var index = Array.IndexOf(_codes, (code ?? "").ToUpperInvariant());
+            if (index < 0) return result;
+
+            long start = -1, end = -1;
+            for (var i = 0; i < _v4First.Length; i++)
+            {
+                if (_v4Code[i] != index) continue;
+                if (start >= 0 && _v4First[i] == end + 1) { end = _v4Last[i]; continue; }
+                if (start >= 0) result.Add(V4Range((uint)start, (uint)end));
+                start = _v4First[i];
+                end = _v4Last[i];
+            }
+            if (start >= 0) result.Add(V4Range((uint)start, (uint)end));
+
+            var open = false;
+            ulong sh = 0, sl = 0, eh = 0, el = 0;
+            for (var i = 0; i < _v6FirstHi.Length; i++)
+            {
+                if (_v6Code[i] != index) continue;
+                // The next range starts right after the last one ends: last + 1, carrying into the high half.
+                var nl = el + 1;
+                var nh = nl == 0 ? eh + 1 : eh;
+                if (open && _v6FirstHi[i] == nh && _v6FirstLo[i] == nl) { eh = _v6LastHi[i]; el = _v6LastLo[i]; continue; }
+                if (open) result.Add(V6Range(sh, sl, eh, el));
+                open = true;
+                sh = _v6FirstHi[i]; sl = _v6FirstLo[i]; eh = _v6LastHi[i]; el = _v6LastLo[i];
+            }
+            if (open) result.Add(V6Range(sh, sl, eh, el));
+            return result;
+        }
+
+        private static string V4Text(uint v) => $"{v >> 24}.{(v >> 16) & 255}.{(v >> 8) & 255}.{v & 255}";
+
+        private static string V4Range(uint first, uint last) => first == last ? V4Text(first) : V4Text(first) + "-" + V4Text(last);
+
+        private static string V6Text(ulong hi, ulong lo)
+        {
+            var bytes = new byte[16];
+            for (var i = 0; i < 8; i++) bytes[i] = (byte)(hi >> (56 - 8 * i));
+            for (var i = 0; i < 8; i++) bytes[8 + i] = (byte)(lo >> (56 - 8 * i));
+            return new IPAddress(bytes).ToString();
+        }
+
+        private static string V6Range(ulong fh, ulong fl, ulong lh, ulong ll) =>
+            fh == lh && fl == ll ? V6Text(fh, fl) : V6Text(fh, fl) + "-" + V6Text(lh, ll);
     }
 
     /// <summary>
@@ -169,6 +219,7 @@ namespace EasyFW.Core
                     SetCountries(CountryDb.Load(gzip));
                 }
                 catch (Exception ex) { Log.Write("Could not load the country file: " + ex.Message); }
+                finally { Loaded.Set(); }
             });
         }
 
@@ -176,6 +227,18 @@ namespace EasyFW.Core
         {
             _db = db;
             Interlocked.Increment(ref _version);
+            Loaded.Set();
+        }
+
+        private static readonly ManualResetEventSlim Loaded = new ManualResetEventSlim(false);
+
+        /// <summary>The ranges of a country. Waits up to 30 seconds for the country file if it's still loading.</summary>
+        public static List<string> RangesOf(string code)
+        {
+            if (_db == null && Volatile.Read(ref _loading) == 1) Loaded.Wait(30000);
+            var db = _db;
+            if (db == null) Log.Write($"The country file isn't loaded, so {code} can't be blocked yet.");
+            return db?.Ranges(code) ?? new List<string>();
         }
 
         private static bool TryParse(string ip, out IPAddress address)
@@ -194,7 +257,25 @@ namespace EasyFW.Core
             return code == null || code == "ZZ" ? null : code;
         }
 
+        /// <summary>Sorting, filtering and painting ask for every row every second, so answers are kept per address.</summary>
         public static string CountryText(string ip)
+        {
+            if (string.IsNullOrEmpty(ip)) return "";
+            var db = _db;
+            if (CountryTexts.Count > MaxNames || !ReferenceEquals(_countryTextsDb, db) || _countryTextsLan != NetRanges.Version)
+            {
+                CountryTexts.Clear();
+                _countryTextsDb = db;
+                _countryTextsLan = NetRanges.Version;
+            }
+            return CountryTexts.GetOrAdd(ip, FindCountryText);
+        }
+
+        private static readonly ConcurrentDictionary<string, string> CountryTexts = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private static volatile CountryDb _countryTextsDb;
+        private static volatile int _countryTextsLan = -1;
+
+        private static string FindCountryText(string ip)
         {
             var code = CountryCode(ip);
             if (code == null) return "";

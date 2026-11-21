@@ -51,7 +51,14 @@ namespace EasyFW
             EventWaitHandle showSignal = null;
             if (!demo && !AcquireSingleInstance()) return 0;
 
+            RuleTranslator.SelfPath = ExePath;
             var env = demo ? BuildDemo() : BuildReal(monitorOnly);
+            if (!demo)
+            {
+                // Kept copies of the blocklists are in force from the first rule rebuild, before any download.
+                env.Service.BlocklistFolder = Blocklists.DefaultFolder;
+                env.Service.LoadBlocklists();
+            }
             if (!demo) showSignal = CreateShowSignal();
 
             using (var context = new TrayContext(env, startInTray, showSignal))
@@ -132,6 +139,13 @@ namespace EasyFW
             ReleaseSingleInstance();
             Process.Start(ExePath);
             Application.ExitThread();
+        }
+
+        /// <summary>Starts the newly installed exe and lets this one exit. The mutex goes first, or the new copy would exit as a duplicate.</summary>
+        public static void RestartAfterUpdate(string exe, bool hidden)
+        {
+            ReleaseSingleInstance();
+            Process.Start(new ProcessStartInfo(exe, hidden ? "--tray" : "") { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(exe) });
         }
 
         private static bool AcquireSingleInstance()

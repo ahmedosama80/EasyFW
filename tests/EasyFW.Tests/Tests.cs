@@ -92,6 +92,9 @@ internal static class Tests
     {
         if (args.Length > 0 && args[0] == "--probe") return Probe();
         if (args.Length > 0 && args[0] == "--avast") { PrintAvastPaths(); return 0; }
+        // The LAN is the PC's Ethernet and Wi-Fi subnets. A fixed one keeps results the same on any machine.
+        NetRanges.AdapterSource = () => new List<(string, string)> { ("192.168.1.0/24", "Wi-Fi"), ("10.0.0.0/24", "Ethernet") };
+        NetRanges.Refresh();
         if (args.Length > 1 && args[0] == "--shots") return Shots(args[1]);
 
         Parser();
@@ -110,6 +113,20 @@ internal static class Tests
         Network();
         TopFlows();
         Lookups();
+        Patterns();
+        Signatures();
+        HistoryAndInternet();
+        ColumnLayouts();
+        WorldMap();
+        PublicIpAndLocation();
+        RuleDurationsTest();
+        Updates();
+        CountryBlocking();
+        LockdownAndSchedules();
+        PasswordsAndFloods();
+        BlocklistTests();
+        PortsAndShares();
+        BandwidthTests();
         Console.WriteLine($"{_pass} passed, {_fail} failed");
         return _fail == 0 ? 0 : 1;
     }
@@ -558,6 +575,811 @@ internal static class Tests
         Check(new[] { 3, 7, 15, 33, 77, 150, 999, 12345 }.All(v => TrafficHistory.AxisMax(v) >= v && TrafficHistory.AxisMax(v) % 2 == 0), "axis top covers the value and halves cleanly");
     }
 
+    private static void Patterns()
+    {
+        var folder = new PatternRule { Pattern = @"C:\Games\*.*" };
+        Check(folder.Matches(@"C:\Games\x.exe") && folder.Matches(@"c:\games\Sub\Deep\y.EXE"), "folder pattern covers subfolders, any case");
+        Check(!folder.Matches(@"C:\GamesX\x.exe") && !folder.Matches(@"D:\Games\x.exe"), "folder pattern stays in its folder");
+        var named = new PatternRule { Pattern = @"*\updater?.exe" };
+        Check(named.Matches(@"C:\a\b\updater1.exe") && !named.Matches(@"C:\a\updater.exe"), "* and ? wildcards");
+        var keyword = new PatternRule { Pattern = "steam" };
+        Check(keyword.IsKeyword && keyword.Matches(@"C:\Program Files (x86)\Steam\steam.exe") && !keyword.Matches(@"C:\x\stea.exe"), "keyword matches anywhere in the path");
+        Check(!keyword.Matches(AppPaths.SystemApp) && !new PatternRule { Pattern = "ping" }.Matches(AppPaths.PingApp), "patterns never cover System or Ping");
+        var env = new PatternRule { Pattern = @"%SystemRoot%\Temp\*" };
+        Check(env.Matches(Environment.ExpandEnvironmentVariables(@"%SystemRoot%\Temp\a.exe")), "environment variables in patterns");
+
+        var b = new FakeBackend();
+        var s = NewService(b);
+        var checkUntil = DateTime.UtcNow.AddSeconds(10);
+        while (s.SignatureCheck(@"C:\Games\none.exe") == null && DateTime.UtcNow < checkUntil) System.Threading.Thread.Sleep(20);
+        Check(s.SignatureCheck(@"C:\Games\none.exe") == false, "a missing file doesn't count as signed");
+        s.SignatureCheck = _ => true;
+        Throws(() => s.SavePattern(new PatternRule { Pattern = "ab" }), "keyword under 3 letters refused");
+        Throws(() => s.SavePattern(new PatternRule { Pattern = @"*\*.*" }), "match-everything pattern refused");
+        Throws(() => s.SavePattern(new PatternRule { Pattern = "  " }), "empty pattern refused");
+
+        s.ProcessEvents(new[] { Blocked(@"C:\Games\old.exe") });
+        Wait(s.DecideAsync(@"C:\Games\mine.exe", RuleAction.Block));
+        s.SavePattern(new PatternRule { Pattern = @"C:\Games\*.*", Action = RuleAction.Allow });
+        Check(s.PatternPreview(s.Config.Patterns[0]).Count == 2, "preview lists pending and ruled apps");
+        Wait(s.ApplyPatternsAsync());
+        Check(s.FindRule(@"C:\Games\old.exe")?.Action == RuleAction.Allow && s.PendingCount == 0, "saving a pattern decides matching pending apps");
+        Check(s.FindRule(@"C:\Games\mine.exe").Action == RuleAction.Block, "an app's own rule wins over a pattern");
+
+        var added = s.ProcessEvents(new[] { Blocked(@"C:\Games\new\n.exe") });
+        Check(added.Count == 0, "a matching new app doesn't notify");
+        Wait(s.ApplyPatternsAsync());
+        var made = s.FindRule(@"C:\Games\new\n.exe");
+        Check(made != null && made.Action == RuleAction.Allow && made.Notes.Contains(@"C:\Games\*.*") && s.PendingCount == 0, "a matching signed app gets its own rule");
+
+        // Accept only goes to signed apps. Unsigned stays pending; one still being checked waits.
+        var signatures = new Dictionary<string, bool?>(StringComparer.OrdinalIgnoreCase) { [@"C:\Games\unsigned.exe"] = false, [@"C:\Games\slow.exe"] = null };
+        s.SignatureCheck = path => signatures.TryGetValue(path, out var v) ? v : true;
+        s.ProcessEvents(new[] { Blocked(@"C:\Games\unsigned.exe"), Blocked(@"C:\Games\slow.exe") });
+        Wait(s.ApplyPatternsAsync());
+        Check(s.FindRule(@"C:\Games\unsigned.exe") == null && s.Config.Pending.Any(p => p.AppPath == @"C:\Games\unsigned.exe"), "an unsigned app isn't accepted and stays pending");
+        Check(s.FindRule(@"C:\Games\slow.exe") == null && s.Config.Pending.Any(p => p.AppPath == @"C:\Games\slow.exe"), "an app still being checked waits");
+        s.ProcessEvents(new[] { Blocked(@"C:\Games\unsigned.exe") });
+        Wait(s.ApplyPatternsAsync());
+        Check(s.FindRule(@"C:\Games\unsigned.exe") == null, "an unsigned app isn't tried again");
+        signatures[@"C:\Games\slow.exe"] = true;
+        Wait(s.ApplyPatternsAsync());
+        Check(s.FindRule(@"C:\Games\slow.exe")?.Action == RuleAction.Allow, "accepted once the check says signed");
+        Wait(s.DecideAsync(@"C:\Games\unsigned.exe", RuleAction.Block));
+
+        s.SavePattern(new PatternRule { Pattern = "games", Action = RuleAction.Block });
+        s.ProcessEvents(new[] { Blocked(@"C:\Games\both.exe") });
+        Wait(s.ApplyPatternsAsync());
+        Check(s.FindRule(@"C:\Games\both.exe")?.Action == RuleAction.Block, "block pattern wins when both match");
+
+        s.DeletePattern(s.Config.Patterns.First(p => p.Pattern == "games"));
+        s.Config.Patterns[0].Enabled = false;
+        s.ProcessEvents(new[] { Blocked(@"C:\Games\later.exe") });
+        Wait(s.ApplyPatternsAsync());
+        Check(s.FindRule(@"C:\Games\later.exe") == null && s.PendingCount == 1, "a disabled pattern does nothing");
+
+        var store = new ConfigStore(null, true);
+        store.Config.Patterns.Add(new PatternRule { Pattern = "steam", Action = RuleAction.Block });
+        var json = Encoding.UTF8.GetString(ConfigStore.Serialize(store.Config));
+        Check(json.Contains("\"Patterns\"") && json.Contains("steam"), "patterns are saved");
+    }
+
+    private static void Signatures()
+    {
+        var notepad = Environment.ExpandEnvironmentVariables(@"%SystemRoot%\System32\notepad.exe");
+        var text = AppSignature.Check(notepad);
+        Check(text.StartsWith("Yes"), "Windows program is signed (catalog or embedded): " + text);
+        var tmp = Path.Combine(Path.GetTempPath(), "easyfw-unsigned-" + Guid.NewGuid().ToString("N") + ".exe");
+        File.WriteAllBytes(tmp, File.ReadAllBytes(notepad).Take(4096).ToArray());
+        try { Check(!AppSignature.Check(tmp).StartsWith("Yes"), "part of a program isn't signed: " + AppSignature.Check(tmp)); }
+        finally { File.Delete(tmp); }
+        var own = typeof(Tests).Assembly.Location;
+        Check(AppSignature.Check(own) == "No", "unsigned build reads No: " + AppSignature.Check(own));
+        Check(AppSignature.Check(@"C:\nope\missing.exe") == "File missing", "missing file");
+        Check(AppSignature.Text(AppPaths.PingApp).StartsWith("Yes"), "pseudo apps count as Windows");
+        var until = DateTime.UtcNow.AddSeconds(20);
+        while (AppSignature.Text(notepad) == "" && DateTime.UtcNow < until) System.Threading.Thread.Sleep(20);
+        Check(AppSignature.Text(notepad).StartsWith("Yes"), "background check finishes");
+    }
+
+    private static void ColumnLayouts()
+    {
+        var s = NewService(new FakeBackend());
+        ListView NewList()
+        {
+            var l = new ListView { View = View.Details };
+            l.Columns.Add("A", 50);
+            l.Columns.Add("B", 60);
+            l.Columns.Add("C", 70);
+            l.CreateControl();
+            var unused = l.Handle;
+            return l;
+        }
+
+        var first = NewList();
+        UiHelpers.RememberColumns(first, "t", s);
+        Check(first.AllowColumnReorder, "columns can be dragged");
+        first.Columns[1].Width = 99;
+        var saved = s.Config.ColumnsFor("t");
+        Check(saved != null && saved.Widths[1] == 99 && saved.Order.SequenceEqual(new[] { 0, 1, 2 }), "a width change is saved");
+
+        s.SaveColumns("t", new[] { 2, 0, 1 }, new[] { 51, 61, 71 });
+        var json = ConfigStore.Serialize(s.Config);
+        var store = new ConfigStore(null, true);
+        store.Config.Columns = ConfigStore.Deserialize(json).Columns;
+        var s2 = new FirewallService(store, new FakeBackend(), RunMode.Live);
+        var second = NewList();
+        UiHelpers.RememberColumns(second, "t", s2);
+        Check(second.Columns[0].DisplayIndex == 2 && second.Columns[1].DisplayIndex == 0 && second.Columns[2].DisplayIndex == 1, "saved order comes back after a restart");
+        Check(second.Columns[0].Width == 51 && second.Columns[2].Width == 71, "saved widths come back");
+        Check(s2.Config.ColumnsFor("t").Order.SequenceEqual(new[] { 2, 0, 1 }), "applying a layout doesn't overwrite it");
+
+        s2.SaveColumns("t", new[] { 0, 1, 2, 3 }, new[] { 1, 2, 3, 4 });
+        var third = NewList();
+        UiHelpers.RememberColumns(third, "t", s2);
+        Check(third.Columns[0].DisplayIndex == 0 && third.Columns[0].Width == 50, "a layout for other columns is ignored");
+
+        s2.SaveColumns("t", new[] { 1, 1, 0 }, null);
+        var fourth = NewList();
+        UiHelpers.RememberColumns(fourth, "t", s2);
+        Check(fourth.Columns[2].DisplayIndex == 2, "a broken layout is ignored");
+
+        UiHelpers.ResetColumns();
+        Check(second.Columns[0].DisplayIndex == 0 && second.Columns[0].Width == 50 && s2.Config.ColumnsFor("t") == null, "reset puts columns back and forgets the layout");
+        foreach (var l in new[] { first, second, third, fourth }) l.Dispose();
+    }
+
+    private static void PublicIpAndLocation()
+    {
+        Check(PublicIp.IsPublic("8.8.8.8") && PublicIp.IsPublic("2001:4860::8888"), "public addresses are accepted");
+        Check(!PublicIp.IsPublic("192.168.1.5") && !PublicIp.IsPublic("10.1") && !PublicIp.IsPublic("<html>") && !PublicIp.IsPublic(""), "LAN, short forms and junk aren't");
+
+        var asked = new List<string>();
+        var fetch = PublicIp.Fetch;
+        try
+        {
+            PublicIp.Fetch = url =>
+            {
+                asked.Add(url);
+                if (asked.Count == 1) throw new System.Net.WebException("down");
+                return Task.FromResult(asked.Count == 2 ? "<html>error</html>" : " 8.8.4.4\n");
+            };
+            PublicIp.RefreshAsync().Wait();
+            Check(PublicIp.Address == "8.8.4.4" && !PublicIp.Failed && asked.Count == 3, "lookup falls back to the next service and trims the answer");
+
+            asked.Clear();
+            PublicIp.Fetch = url => { asked.Add(url); return Task.FromResult("192.168.0.1"); };
+            PublicIp.RefreshAsync().Wait();
+            Check(PublicIp.Failed && asked.Count == PublicIp.Services.Length, "no public answer: failed after trying every service");
+        }
+        finally
+        {
+            PublicIp.Fetch = fetch;
+            PublicIp.Set(null);
+        }
+
+        var cfg = new AppConfig();
+        var self = RuleTranslator.SelfPath;
+        try
+        {
+            RuleTranslator.SelfPath = @"C:\Program Files\EasyFW\EasyFW.exe";
+            var rule = RuleTranslator.All(cfg).SingleOrDefault(r => r.AppPath == RuleTranslator.SelfPath);
+            Check(rule != null && rule.Allow && rule.Direction == TrafficDirection.Outbound && rule.Protocol == FirewallProtocols.Tcp && rule.RemotePorts == "443",
+                "EasyFW may make HTTPS calls for its public IP, nothing else");
+            cfg.NoPublicIpLookup = true;
+            Check(RuleTranslator.All(cfg).All(r => r.AppPath != RuleTranslator.SelfPath), "turning the lookup off removes that rule");
+        }
+        finally { RuleTranslator.SelfPath = self; }
+        Check(RuleTranslator.All(new AppConfig()).All(r => r.AppPath == null || !r.AppPath.EndsWith("EasyFW.exe")), "no rule for EasyFW when its path isn't known");
+
+        var cairo = WorldGeo.FindCity("eg", "cairo");
+        Check(cairo != null && cairo.Name == "Cairo" && Math.Abs(cairo.Lat - 30) < 1, "cities are found, any case");
+        Check(WorldGeo.CitiesOf("US").Count > 10 && WorldGeo.CitiesOf("US").Select(c => c.Name).SequenceEqual(WorldGeo.CitiesOf("US").Select(c => c.Name).OrderBy(n => n, StringComparer.CurrentCultureIgnoreCase)),
+            "a country's cities are sorted by name");
+        Check(WorldGeo.FindCity("US", "Ho Chi Minh City") == null && WorldGeo.FindCity("VN", "Ho Chi Minh City") != null, "city names with spaces belong to their own country");
+        var badCities = WorldGeo.Countries.SelectMany(WorldGeo.CitiesOf).Where(c => !WorldGeo.TryLocate(c.Country, out _, out _) || c.Lat > WorldGeo.North || c.Lat < WorldGeo.South).ToList();
+        Check(badCities.Count == 0, "every city is on the map in a known country: " + string.Join(",", badCities.Select(c => c.Name)));
+
+        var s = NewService(new FakeBackend());
+        s.SetMapHome("EG", "Alexandria");
+        var loc = s.Location;
+        Check(loc.Source == LocationSource.Chosen && loc.City == "Alexandria" && Math.Abs(loc.Lat - 31.2) < 0.1 && loc.Text.StartsWith("Alexandria, "), "chosen city");
+        s.SetMapHome("EG", "Atlantis");
+        Check(s.Location.City == null && s.Location.Country == "EG", "an unknown city means the whole country");
+        s.SetMapHome(null);
+        PublicIp.Set("8.8.8.8");
+        try
+        {
+            var expected = IpInfo.CountryCode("8.8.8.8");
+            Check(expected == null || s.Location.Source == LocationSource.PublicIp && s.Location.Country == expected, "public IP country comes before the Windows region");
+            s.Config.NoPublicIpLookup = true;
+            Check(s.Location.Source != LocationSource.PublicIp, "with the lookup off, the public IP isn't used");
+        }
+        finally { PublicIp.Set(null); }
+    }
+
+    private static void RuleDurationsTest()
+    {
+        var b = new FakeBackend();
+        var s = NewService(b);
+        Wait(s.EnableAsync());
+        var now = new DateTime(2026, 11, 20, 12, 0, 0, DateTimeKind.Utc);
+        var boot = now.AddHours(-3);
+        s.Clock = () => now;
+        s.BootTime = () => boot;
+
+        Wait(s.DecideAsync(@"C:\a.exe", RuleAction.Allow, null, RuleDuration.Minutes10));
+        Wait(s.DecideAsync(@"C:\b.exe", RuleAction.Allow, null, RuleDuration.UntilRestart));
+        Wait(s.DecideAsync(@"C:\c.exe", RuleAction.Block, null, RuleDuration.Hour1));
+        Wait(s.DecideAsync(@"C:\d.exe", RuleAction.Allow));
+        var a = s.FindRule(@"C:\a.exe");
+        Check(a.ExpiresUtc == now.AddMinutes(10) && a.BootUtc == null && a.IsTemporary, "10 minutes ends 10 minutes from now");
+        Check(s.FindRule(@"C:\b.exe").BootUtc == boot && s.FindRule(@"C:\b.exe").ExpiresUtc == null, "until restart remembers this boot");
+        Check(!s.FindRule(@"C:\d.exe").IsTemporary, "Accept Always is forever");
+        Check(a.ExpiresText(now) == $"In 10 min ({now.AddMinutes(10).ToLocalTime():HH:mm})" && s.FindRule(@"C:\b.exe").ExpiresText(now) == "At restart"
+              && s.FindRule(@"C:\d.exe").ExpiresText(now) == "Never", "Expires column text");
+        Check(s.Evaluate(@"C:\a.exe", TrafficDirection.Outbound, 443) == Verdict.Accepted, "accepted while it lasts");
+
+        now = now.AddMinutes(9);
+        Check(Wait2(s.ExpireRulesAsync()).Count == 0 && s.Config.Rules.Count == 4, "nothing ends early");
+
+        now = now.AddMinutes(1);
+        var ended = Wait2(s.ExpireRulesAsync());
+        Check(ended.Count == 1 && ended[0].AppPath == @"C:\a.exe" && s.FindRule(@"C:\a.exe") == null, "the rule ends on time");
+        Check(s.Evaluate(@"C:\a.exe", TrafficDirection.Outbound, 443) == Verdict.Blocked, "and the app is blocked again");
+        Check(b.Managed.All(r => r.AppPath != @"C:\a.exe"), "its Windows rules are gone");
+
+        boot = boot.AddSeconds(70);
+        Check(Wait2(s.ExpireRulesAsync()).Count == 0, "a clock change of a minute isn't a restart");
+        boot = now.AddMinutes(-2);
+        ended = Wait2(s.ExpireRulesAsync());
+        Check(ended.Count == 1 && ended[0].AppPath == @"C:\b.exe", "until-restart ends after a restart");
+
+        Wait(s.DecideAsync(@"C:\c.exe", RuleAction.Block));
+        now = now.AddHours(2);
+        Check(Wait2(s.ExpireRulesAsync()).Count == 0 && s.FindRule(@"C:\c.exe") != null && !s.FindRule(@"C:\c.exe").IsTemporary,
+            "deciding again forever makes a temporary rule permanent");
+        Check(s.FindRule(@"C:\d.exe") != null, "permanent rules never end");
+
+        Wait(s.DecideAsync(@"C:\e.exe", RuleAction.Allow, null, RuleDuration.Minutes30));
+        var copy = ConfigStore.Deserialize(ConfigStore.Serialize(s.Config)).Rules.Single(r => r.AppPath == @"C:\e.exe");
+        Check(copy.ExpiresUtc == now.AddMinutes(30) && copy.IsTemporary, "the end time is saved");
+
+        Check(RuleDurations.ActionText(RuleAction.Allow, RuleDuration.Forever) == "Accept Always"
+              && RuleDurations.ActionText(RuleAction.Block, RuleDuration.Minutes10) == "Block for 10 min"
+              && RuleDurations.ActionText(RuleAction.Allow, RuleDuration.UntilRestart) == "Accept until restart", "button names");
+        Check(SystemBoot.Utc() < DateTime.UtcNow && SystemBoot.Utc() > DateTime.UtcNow.AddYears(-1), "boot time is read from Windows");
+    }
+
+    private static T Wait2<T>(Task<T> t)
+    {
+        Wait(t);
+        return t.Result;
+    }
+
+    private static void Updates()
+    {
+        Check(Updater.ParseTag("v2.1.0") == new Version(2, 1, 0) && Updater.ParseTag("2.1") == new Version(2, 1, 0) && Updater.ParseTag("latest") == null, "release tags read as versions");
+        string Json(string tag, bool draft = false, bool pre = false, string url = null, string digest = null) =>
+            "{\"tag_name\":\"" + tag + "\",\"html_url\":\"https://github.com/" + Updater.Repo + "/releases/tag/" + tag + "\",\"draft\":" + (draft ? "true" : "false") +
+            ",\"prerelease\":" + (pre ? "true" : "false") + ",\"assets\":[{\"name\":\"notes.md\",\"browser_download_url\":\"https://github.com/" + Updater.Repo + "/releases/download/x/notes.md\",\"size\":5}," +
+            "{\"name\":\"EasyFW-" + tag.TrimStart('v') + "-windows.zip\",\"browser_download_url\":\"" + (url ?? "https://github.com/" + Updater.Repo + "/releases/download/" + tag + "/EasyFW-" + tag.TrimStart('v') + "-windows.zip") +
+            "\",\"size\":1234" + (digest != null ? ",\"digest\":\"" + digest + "\"" : "") + ",\"extra\":1}],\"body\":\"x\"}";
+        var r = Updater.Parse(Json("v2.1.0", digest: "sha256:ABCDEF"));
+        Check(r != null && r.Version == new Version(2, 1, 0) && r.ZipName == "EasyFW-2.1.0-windows.zip" && r.ZipSize == 1234 && r.Sha256 == "abcdef", "GitHub's answer is read");
+        Check(Updater.Parse(Json("v2.1.0", draft: true)) == null && Updater.Parse(Json("v2.1.0", pre: true)) == null, "drafts and pre-releases are skipped");
+        Check(Updater.Parse(Json("v2.1.0", url: "https://evil.example/EasyFW-2.1.0-windows.zip")) == null, "a zip from anywhere but this repo is refused");
+        Check(Updater.Parse(null) == null && Updater.Parse("") == null, "no release published");
+        Check(Updater.IsNewer(r, "2.0.0") && !Updater.IsNewer(r, "2.1.0") && !Updater.IsNewer(r, "2.2") && !Updater.IsNewer(null, "1.0.0"), "only a newer version updates");
+
+        var root = Path.Combine(Path.GetTempPath(), "EasyFW-update-test-" + Guid.NewGuid().ToString("N").Substring(0, 6));
+        var download = Updater.Download;
+        try
+        {
+            var exe = typeof(AppInfo).Assembly.Location;
+            var zipBytes = new MemoryStream();
+            using (var zip = new System.IO.Compression.ZipArchive(zipBytes, System.IO.Compression.ZipArchiveMode.Create, true))
+            {
+                System.IO.Compression.ZipFileExtensions.CreateEntryFromFile(zip, exe, "EasyFW.exe");
+                using (var w = new StreamWriter(zip.CreateEntry("README.md").Open())) w.Write("new readme");
+                using (var w = new StreamWriter(zip.CreateEntry("sub/evil.exe").Open())) w.Write("x");
+                using (var w = new StreamWriter(zip.CreateEntry("../escape.txt").Open())) w.Write("x");
+            }
+            var bytes = zipBytes.ToArray();
+            Updater.Download = (url, path) => { File.WriteAllBytes(path, bytes); return Task.CompletedTask; };
+            string Sha(byte[] b) { using var sha = System.Security.Cryptography.SHA256.Create(); return string.Concat(sha.ComputeHash(b).Select(x => x.ToString("x2"))); }
+
+            var mine = Updater.ParseTag(AppInfo.Version);
+            var good = new ReleaseInfo { Version = mine, ZipUrl = "https://github.com/x", ZipSize = bytes.Length, Sha256 = Sha(bytes) };
+            var staging = Updater.StageAsync(good, Path.Combine(root, "work")).GetAwaiter().GetResult();
+            var staged = Directory.GetFiles(staging).Select(Path.GetFileName).OrderBy(n => n).ToList();
+            Check(staged.SequenceEqual(new[] { "EasyFW.exe", "README.md" }), "only top-level files are unpacked: " + string.Join(",", staged));
+            Check(!File.Exists(Path.Combine(root, "escape.txt")) && !File.Exists(Path.Combine(root, "work", "escape.txt")), "nothing escapes the folder");
+
+            Throws(() => Updater.StageAsync(new ReleaseInfo { Version = mine, ZipUrl = "x", Sha256 = new string('0', 64) }, Path.Combine(root, "work")).GetAwaiter().GetResult(), "a checksum mismatch stops the update");
+            Throws(() => Updater.StageAsync(new ReleaseInfo { Version = mine, ZipUrl = "x", ZipSize = 5 }, Path.Combine(root, "work")).GetAwaiter().GetResult(), "a size mismatch stops the update");
+            Throws(() => Updater.StageAsync(new ReleaseInfo { Version = new Version(mine.Major + 1, 0, 0), ZipUrl = "x" }, Path.Combine(root, "work")).GetAwaiter().GetResult(), "an exe of another version stops the update");
+
+            var install = Path.Combine(root, "install");
+            Directory.CreateDirectory(install);
+            File.WriteAllText(Path.Combine(install, "EasyFW.exe"), "old exe");
+            File.WriteAllText(Path.Combine(install, "README.md"), "old readme");
+            File.WriteAllText(Path.Combine(install, "config.keep"), "mine");
+            staging = Updater.StageAsync(good, Path.Combine(root, "work")).GetAwaiter().GetResult();
+            Updater.Install(staging, install);
+            Check(File.ReadAllText(Path.Combine(install, "README.md")) == "new readme" && new FileInfo(Path.Combine(install, "EasyFW.exe")).Length == new FileInfo(exe).Length,
+                "new files are in place");
+            Check(File.ReadAllText(Path.Combine(install, "EasyFW.exe.old")) == "old exe" && File.ReadAllText(Path.Combine(install, "config.keep")) == "mine", "old files kept aside, others untouched");
+            Updater.CleanUp(install);
+            Check(!Directory.GetFiles(install, "*.old").Any(), "old files go at the next start");
+
+            // A failure halfway puts everything back.
+            var broken = Path.Combine(root, "broken");
+            Directory.CreateDirectory(broken);
+            File.WriteAllText(Path.Combine(broken, "EasyFW.exe"), "newer exe");
+            File.WriteAllText(Path.Combine(broken, "zz.txt"), "x");
+            Directory.CreateDirectory(Path.Combine(install, "zz.txt"));
+            var before = File.ReadAllBytes(Path.Combine(install, "EasyFW.exe"));
+            Throws(() => Updater.Install(broken, install), "a failed install reports it");
+            Check(File.ReadAllBytes(Path.Combine(install, "EasyFW.exe")).SequenceEqual(before) && !File.Exists(Path.Combine(install, "EasyFW.exe.old")), "and puts the old exe back");
+        }
+        finally
+        {
+            Updater.Download = download;
+            try { Directory.Delete(root, true); } catch (IOException) { }
+        }
+
+        var cfg = new AppConfig { NoPublicIpLookup = true, Updates = UpdateChoice.Auto };
+        var self = RuleTranslator.SelfPath;
+        try
+        {
+            RuleTranslator.SelfPath = @"C:\Program Files\EasyFW\EasyFW.exe";
+            Check(RuleTranslator.All(cfg).Any(x => x.AppPath == RuleTranslator.SelfPath && x.RemotePorts == "443"), "automatic updates keep EasyFW's HTTPS rule");
+            cfg.Updates = UpdateChoice.Off;
+            Check(RuleTranslator.All(cfg).All(x => x.AppPath != RuleTranslator.SelfPath), "with updates and the public IP off, there's no rule");
+        }
+        finally { RuleTranslator.SelfPath = self; }
+        var saved = ConfigStore.Deserialize(ConfigStore.Serialize(new AppConfig { Updates = UpdateChoice.Auto }));
+        Check(saved.Updates == UpdateChoice.Auto && new AppConfig().Updates == UpdateChoice.NotAsked, "the answer is saved, and starts unasked");
+    }
+
+    private static void CountryBlocking()
+    {
+        var csv = "1.0.0.0,1.0.0.255,AU\n1.0.1.0,1.0.3.255,AU\n1.0.4.0,1.0.4.0,CN\n1.0.5.0,1.0.5.255,AU\n" +
+                  "2001:db8::,2001:db8::ffff,AU\n2001:db8::1:0,2001:db8::1:ffff,AU\n2001:db8::2:0,2001:db8::2:ffff,CN\n";
+        var db = CountryDb.Load(new MemoryStream(Encoding.ASCII.GetBytes(csv)));
+        var au = db.Ranges("au");
+        Check(au.SequenceEqual(new[] { "1.0.0.0-1.0.3.255", "1.0.5.0-1.0.5.255", "2001:db8::-2001:db8::1:ffff" }), "a country's ranges, neighbours joined: " + string.Join(" ", au));
+        Check(db.Ranges("CN").SequenceEqual(new[] { "1.0.4.0", "2001:db8::2:0-2001:db8::2:ffff" }) && db.Ranges("XX").Count == 0, "single addresses and unknown countries");
+
+        var ranges = RuleTranslator.CountryRanges;
+        try
+        {
+            RuleTranslator.CountryRanges = code => Enumerable.Range(0, code == "CN" ? 2500 : 3).Select(i => $"10.{i / 256}.{i % 256}.0-10.{i / 256}.{i % 256}.255").ToList();
+            var specs = RuleTranslator.CountryRules(new AppConfig { BlockedCountries = new List<string> { "CN", "RU" } });
+            Check(specs.Count == 3 * 2 + 1 * 2, "big countries split into several rules, both ways");
+            Check(specs.All(x => !x.Allow && x.AppPath == null && x.Name.Contains(RuleTranslator.CountryTag)), "they block every app");
+            Check(specs.Where(x => x.Name.Contains(" CN ")).Sum(x => x.RemoteAddresses.Split(',').Length) == 2500 * 2, "no range is left out");
+
+            var b = new FakeBackend();
+            var s = NewService(b);
+            Wait(s.EnableAsync());
+            Wait(s.DecideAsync(@"C:\app.exe", RuleAction.Allow));
+            s.CountryOf = ip => ip == "5.5.5.5" ? "CN" : "US";
+            Check(s.Evaluate(@"C:\app.exe", TrafficDirection.Outbound, 443, "5.5.5.5") == Verdict.Accepted, "accepted before blocking");
+            Wait(s.SetBlockedCountriesAsync(new[] { "cn" }));
+            Check(s.Config.BlockedCountries.SequenceEqual(new[] { "CN" }) && b.Managed.Count(x => x.Name.Contains(RuleTranslator.CountryTag)) == 6, "blocking adds the country's rules");
+            Check(s.Evaluate(@"C:\app.exe", TrafficDirection.Outbound, 443, "5.5.5.5") == Verdict.Blocked
+                  && s.Evaluate(@"C:\app.exe", TrafficDirection.Outbound, 443, "6.6.6.6") == Verdict.Accepted, "even an accepted app can't reach a blocked country");
+            var open = new ActiveEndpoint { Protocol = "TCP", State = "Established", Pid = 5, AppPath = @"C:\app.exe", Direction = TrafficDirection.Outbound, LocalIp = "192.168.1.5", RemoteIp = "5.5.5.5", RemotePort = 443 };
+            Check(s.FindDisallowed(new[] { open }).Count == 1, "open connections to it are closed");
+            Wait(s.ReconcileAsync(true));
+            Check(b.Managed.Count(x => x.Name.Contains(RuleTranslator.CountryTag)) == 6, "a full rebuild keeps them");
+            Wait(s.SetBlockedCountriesAsync(new[] { "RU" }));
+            Check(b.Managed.Count(x => x.Name.Contains(RuleTranslator.CountryTag)) == 2 && b.Managed.All(x => !x.Name.Contains(" CN ")), "unblocking removes them");
+        }
+        finally { RuleTranslator.CountryRanges = ranges; }
+    }
+
+    private static void LockdownAndSchedules()
+    {
+        var clock = RuleTranslator.LocalNow;
+        try
+        {
+            var mondayNoon = new DateTime(2026, 11, 16, 12, 0, 0);
+            var now = mondayNoon;
+            RuleTranslator.LocalNow = () => now;
+
+            var work = new AppRule { ScheduleDays = 0b0111110, ScheduleFrom = 9 * 60, ScheduleTo = 17 * 60 };
+            Check(work.InSchedule(mondayNoon) && !work.InSchedule(mondayNoon.AddHours(6)) && !work.InSchedule(mondayNoon.AddDays(5)), "weekday office hours");
+            Check(work.ScheduleText == "Mon-Fri 09:00-17:00", "hours text: " + work.ScheduleText);
+            var night = new AppRule { ScheduleDays = 1 << (int)DayOfWeek.Friday, ScheduleFrom = 22 * 60, ScheduleTo = 2 * 60 };
+            var friday = new DateTime(2026, 11, 20);
+            Check(night.InSchedule(friday.AddHours(23)) && night.InSchedule(friday.AddDays(1).AddHours(1)) && !night.InSchedule(friday.AddDays(1).AddHours(3))
+                  && !night.InSchedule(friday.AddDays(-1).AddHours(23)), "hours past midnight belong to the day they start");
+            Check(new AppRule().InSchedule(friday) && new AppRule().ScheduleText == "Any time", "no hours means any time");
+
+            var b = new FakeBackend();
+            var s = NewService(b);
+            Wait(s.EnableAsync());
+            Wait(s.SaveRuleAsync(new AppRule { AppPath = @"C:\keep.exe", KeepInLockdown = true }));
+            Wait(s.SaveRuleAsync(new AppRule { AppPath = @"C:\other.exe" }));
+            Wait(s.SaveRuleAsync(new AppRule { AppPath = @"C:\bad.exe", Action = RuleAction.Block }));
+            Wait(s.SaveRuleAsync(new AppRule { AppPath = @"C:\games.exe", ScheduleDays = 0b1111111, ScheduleFrom = 18 * 60, ScheduleTo = 22 * 60 }));
+            bool Has(string app) => b.Managed.Any(x => x.AppPath == app);
+            Check(Has(@"C:\keep.exe") && Has(@"C:\other.exe") && Has(@"C:\bad.exe") && !Has(@"C:\games.exe"), "an app outside its hours gets no allow rule");
+            Check(s.Evaluate(@"C:\games.exe", TrafficDirection.Outbound, 443) == Verdict.Blocked, "and is blocked");
+
+            now = mondayNoon.AddHours(7);
+            var switched = Wait2(s.ApplySchedulesAsync());
+            Check(switched.Count == 1 && switched[0].Allowed && Has(@"C:\games.exe") && s.Evaluate(@"C:\games.exe", TrafficDirection.Outbound, 443) == Verdict.Accepted, "its hours start: allowed");
+            Check(Wait2(s.ApplySchedulesAsync()).Count == 0, "nothing more until the hours change");
+            now = mondayNoon.AddHours(10).AddMinutes(1);
+            switched = Wait2(s.ApplySchedulesAsync());
+            Check(switched.Count == 1 && !switched[0].Allowed && !Has(@"C:\games.exe"), "its hours end: blocked again");
+
+            Wait(s.SetLockdownAsync(true));
+            Check(Has(@"C:\keep.exe") && !Has(@"C:\other.exe") && Has(@"C:\bad.exe"), "lockdown keeps only the chosen apps, and block rules");
+            Check(s.Evaluate(@"C:\other.exe", TrafficDirection.Outbound, 443) == Verdict.Blocked && s.Evaluate(@"C:\keep.exe", TrafficDirection.Outbound, 443) == Verdict.Accepted, "lockdown verdicts");
+            Check(s.Config.Rules.Count == 4, "lockdown doesn't change the rules");
+            Wait(s.SetLockdownAppsAsync(new[] { s.FindRule(@"C:\other.exe").Id }));
+            Check(Has(@"C:\other.exe") && !Has(@"C:\keep.exe"), "changing lockdown apps applies at once");
+            Wait(s.SetLockdownAsync(false));
+            Check(Has(@"C:\keep.exe") && Has(@"C:\other.exe") && !Has(@"C:\games.exe"), "after lockdown everything is back, hours still count");
+            var saved = ConfigStore.Deserialize(ConfigStore.Serialize(s.Config));
+            Check(saved.Rules.Single(x => x.AppPath == @"C:\games.exe").ScheduleTo == 22 * 60 && saved.Rules.Single(x => x.AppPath == @"C:\other.exe").KeepInLockdown, "hours and lockdown choices are saved");
+        }
+        finally { RuleTranslator.LocalNow = clock; }
+    }
+
+    private static void PasswordsAndFloods()
+    {
+        var hash = Password.Hash("s3cret");
+        Check(hash.StartsWith("pbkdf2-sha256:") && !hash.Contains("s3cret"), "the password itself isn't saved");
+        Check(Password.Verify("s3cret", hash) && !Password.Verify("S3cret", hash) && !Password.Verify("", hash) && !Password.Verify("s3cret", "junk"), "passwords check");
+        Check(Password.Hash("s3cret") != hash, "each hash is salted");
+        var s = NewService(new FakeBackend());
+        Check(!s.HasPassword && s.CheckPassword("anything"), "no password: anything goes");
+        s.SetPassword("1234");
+        Check(s.HasPassword && s.CheckPassword("1234") && !s.CheckPassword("4321"), "service checks it");
+        var guard = (Guard.Service, Guard.Prompt);
+        try
+        {
+            Guard.Service = s;
+            Guard.Prompt = false;
+            Guard.Lock();
+            Check(!Guard.Unlock(null, "Test"), "with a password, changes are refused without it");
+            s.SetPassword(null);
+            Check(Guard.Unlock(null, "Test"), "removing it lets changes through");
+        }
+        finally { (Guard.Service, Guard.Prompt) = guard; }
+
+        var t = new DateTime(2026, 11, 20, 12, 0, 0, DateTimeKind.Utc);
+        var f = new FloodDetector();
+        FirewallEvent E(DateTime at, string app = @"C:\a.exe", string ip = "8.8.8.8", TrafficDirection d = TrafficDirection.Outbound, Verdict v = Verdict.Accepted, int port = 443)
+        {
+            var e = Blocked(app, d, ip);
+            e.TimeUtc = at;
+            e.Verdict = v;
+            e.LocalPort = port;
+            return e;
+        }
+        // Five quiet minutes: a few attempts a second.
+        var quietAlerts = 0;
+        for (var sec = 0; sec < 300; sec++)
+            quietAlerts += f.Add(Enumerable.Range(0, 3).Select(i => E(t.AddSeconds(sec), @"C:\app" + i + ".exe")), t.AddSeconds(sec)).Count;
+        Check(quietAlerts == 0, "quiet traffic raises nothing");
+        var now = t.AddSeconds(305);
+        var burst = Enumerable.Range(0, 500).Select(i => E(now.AddMilliseconds(-i * 10), @"C:\app" + (i % 4) + ".exe")).ToList();
+        var alerts = f.Add(burst, now);
+        Check(alerts.Count(a => a.Kind == FloodKind.Spike) == 1, "a sudden burst raises an alert");
+        Check(f.Add(burst.Take(10).Select(e => E(now.AddSeconds(1))), now.AddSeconds(1)).All(a => a.Kind != FloodKind.Spike), "and only once per 10 minutes");
+
+        var f2 = new FloodDetector();
+        var later = t.AddMinutes(20);
+        var appAlerts = f2.Add(Enumerable.Range(0, 300).Select(i => E(later.AddMilliseconds(-i * 20), @"C:\Tools\miner.exe", "9.9.9." + (i % 50))), later);
+        var appAlert = appAlerts.SingleOrDefault(a => a.Kind == FloodKind.AppBurst);
+        Check(appAlert != null && appAlert.Title.StartsWith("miner.exe") && appAlert.Text.Contains("50 address"), "one app opening a flood of connections is named");
+        var scan = f2.Add(Enumerable.Range(0, 45).Select(i => E(later.AddMilliseconds(-i * 100), null, "203.0.113.9", TrafficDirection.Inbound, Verdict.Blocked, 20 + i)), later,
+            ip => ip == "203.0.113.9" ? "Testland" : null);
+        var scanAlert = scan.SingleOrDefault(a => a.Kind == FloodKind.Scan);
+        Check(scanAlert != null && scanAlert.Title == "Possible port scan" && scanAlert.Text.Contains("203.0.113.9 (Testland)") && scanAlert.Text.Contains("45 ports"), "a port scan names the address");
+    }
+
+    private static void BlocklistTests()
+    {
+        var spamhaus = "{\"cidr\":\"1.10.16.0/20\",\"sblid\":\"SBL256894\",\"rir\":\"apnic\"}\n{\"cidr\":\"2a06:e480::/29\",\"sblid\":\"SBL1\",\"rir\":\"ripenca\"}\n" +
+                       "{\"type\":\"metadata\",\"timestamp\":1716425062,\"size\":82331,\"records\":1435,\"copyright\":\"(c) 2024 The Spamhaus Project SLU\"}\n";
+        Check(Blocklists.Parse(spamhaus).SequenceEqual(new[] { "1.10.16.0/20", "2a06:e480::/29" }), "Spamhaus JSON lines are read, metadata skipped: " + string.Join(" ", Blocklists.Parse(spamhaus)));
+        var firehol = "#\n# firehol_level1\n#\n0.0.0.0/8\n10.0.0.0/8\n1.19.0.0/16\n127.0.0.0/8\n192.168.0.0/16\n224.0.0.0/3\n1.0.0.0/4\n45.9.20.0/24\n45.9.20.0/24\n";
+        Check(Blocklists.Parse(firehol).SequenceEqual(new[] { "1.19.0.0/16", "45.9.20.0/24" }), "LAN, reserved, multicast, too-wide and repeated entries are dropped");
+        Check(Blocklists.Parse("# Feodo\n# comment 1.2.3.4\n162.243.103.246\n\n50.16.16.211\r\n").SequenceEqual(new[] { "162.243.103.246/32", "50.16.16.211/32" }), "plain addresses with comments");
+        Check(Blocklists.Parse("1.10.16.0/20 ; SBL256894\n").Single() == "1.10.16.0/20", "the old Spamhaus text format");
+        Check(!Blocklists.IsSafe("172.16.5.0/24") && !Blocklists.IsSafe("fe80::/64") && Blocklists.IsSafe("198.51.100.7/32"), "safety check");
+
+        var specs = RuleTranslator.BlocklistRules(Enumerable.Range(0, 1500).Select(i => $"45.{i / 256}.{i % 256}.0/24").ToList());
+        Check(specs.Count == 4 && specs.All(x => !x.Allow && x.AppPath == null && x.Name.Contains(Blocklists.Tag)), "blocklist rules: split, both ways, every app");
+
+        var folder = Path.Combine(Path.GetTempPath(), "EasyFW-bl-" + Guid.NewGuid().ToString("N").Substring(0, 6));
+        var fetch = Blocklists.Fetch;
+        var self = RuleTranslator.SelfPath;
+        try
+        {
+            var pages = new Dictionary<string, string>
+            {
+                [Blocklists.Find("feodo").Urls[0]] = "# Feodo\n198.51.100.7\n198.51.100.8\n198.51.100.9\n45.9.20.1\n45.9.20.2\n",
+                [Blocklists.Find("firehol-level1").Urls[0]] = "10.0.0.0/8\n45.9.20.0/24\n203.0.113.0/24\n45.10.0.0/16\n45.11.0.0/16\n45.12.0.0/16\n",
+            };
+            var asked = new List<string>();
+            Blocklists.Fetch = url => { asked.Add(url); return Task.FromResult(pages.TryGetValue(url, out var t) ? t : "<html>not found</html>"); };
+
+            Check(Blocklists.DownloadAsync(Blocklists.Find("feodo"), folder).GetAwaiter().GetResult() == 5 && File.Exists(Path.Combine(folder, "feodo.txt")), "a list downloads and is kept");
+            Throws(() => Blocklists.DownloadAsync(Blocklists.Find("et-compromised"), folder).GetAwaiter().GetResult(), "a broken download is refused");
+            Check(!File.Exists(Path.Combine(folder, "et-compromised.txt")), "and nothing is kept for it");
+
+            var index = BlocklistIndex.Build(Blocklists.LoadKept(new[] { "feodo", "firehol-level1" }, folder), null);
+            Check(index.Count == 5 && index.Match("198.51.100.8") == "abuse.ch Feodo Tracker" && index.Match("8.8.8.8") == null, "lookups name the list");
+            Check(BlocklistIndex.Build(Blocklists.LoadKept(new[] { "feodo" }, folder), new[] { "198.51.100.8", "45.9.20.0/24" }).Entries
+                  .SequenceEqual(new[] { "198.51.100.7/32", "198.51.100.9/32" }), "exceptions take out anything they touch");
+
+            RuleTranslator.SelfPath = @"C:\Program Files\EasyFW\EasyFW.exe";
+            var b = new FakeBackend();
+            var s = NewService(b);
+            s.BlocklistFolder = folder;
+            s.Config.NoPublicIpLookup = true;
+            Wait(s.EnableAsync());
+            Wait(s.DecideAsync(@"C:\app.exe", RuleAction.Allow));
+            Check(!b.Managed.Any(x => x.AppPath == RuleTranslator.SelfPath), "no own HTTPS rule before lists are chosen");
+            asked.Clear();
+            var problems = Wait2(s.SetBlocklistsAsync(new[] { "feodo", "firehol-level1", "nonsense" }, new[] { "203.0.113.50", "" }));
+            Check(problems == "" && asked.Count == 1 && asked[0].Contains("firehol"), "only lists not kept yet are downloaded");
+            Check(s.Config.Blocklists.SequenceEqual(new[] { "feodo", "firehol-level1" }) && s.Config.BlocklistExceptions.SequenceEqual(new[] { "203.0.113.50" }), "choices are saved, unknown ids dropped");
+            Check(b.Managed.Any(x => x.AppPath == RuleTranslator.SelfPath && x.RemotePorts == "443"), "EasyFW may connect to fetch the lists");
+            Check(b.Managed.Count(x => x.Name.Contains(Blocklists.Tag)) == 2, "the lists are in Windows Firewall");
+            Check(s.Evaluate(@"C:\app.exe", TrafficDirection.Outbound, 443, "45.10.3.4") == Verdict.Blocked
+                  && s.Evaluate(@"C:\app.exe", TrafficDirection.Outbound, 443, "203.0.113.9") == Verdict.Accepted
+                  && s.Evaluate(@"C:\app.exe", TrafficDirection.Outbound, 443, "8.8.8.8") == Verdict.Accepted, "listed addresses are blocked even for accepted apps; exceptions aren't");
+            Check(s.FindDisallowed(new[] { new ActiveEndpoint { Protocol = "TCP", State = "Established", Pid = 5, AppPath = @"C:\app.exe", Direction = TrafficDirection.Outbound, LocalIp = "192.168.1.5", RemoteIp = "198.51.100.7", RemotePort = 443 } }).Count == 1,
+                "open connections to listed addresses are closed");
+            Wait(s.ReconcileAsync(true));
+            Check(b.Managed.Count(x => x.Name.Contains(Blocklists.Tag)) == 2, "a full rebuild keeps the lists");
+            Check(BlocklistIndex.Current.Match("45.9.20.200") != null, "the Blocklist column sees the lists");
+
+            pages[Blocklists.Find("feodo").Urls[0]] = "nothing useful";
+            problems = Wait2(s.UpdateBlocklistsAsync());
+            Check(problems.Contains("Feodo") && s.Blocklist.Match("198.51.100.7") != null && s.Config.BlocklistsUpdatedUtc != null, "a failed update keeps the last good copy");
+
+            Wait2(s.SetBlocklistsAsync(new string[0], new string[0]));
+            Check(!b.Managed.Any(x => x.Name.Contains(Blocklists.Tag)) && s.Evaluate(@"C:\app.exe", TrafficDirection.Outbound, 443, "45.10.3.4") == Verdict.Accepted, "no lists, no blocking");
+            Check(!b.Managed.Any(x => x.AppPath == RuleTranslator.SelfPath), "and EasyFW's own HTTPS rule goes too");
+            Throws(() => Wait2(s.SetBlocklistsAsync(new[] { "feodo" }, new[] { "not an address" })), "a bad exception is refused");
+        }
+        finally
+        {
+            Blocklists.Fetch = fetch;
+            RuleTranslator.SelfPath = self;
+            BlocklistIndex.Current = BlocklistIndex.Empty;
+            try { Directory.Delete(folder, true); } catch (IOException) { }
+        }
+    }
+
+    internal static List<ActiveEndpoint> SampleEndpoints() => new List<ActiveEndpoint>
+    {
+        new ActiveEndpoint { Protocol = "TCP", State = "Listening", LocalIp = "0.0.0.0", LocalPort = 3389, Pid = 1100, ProcessName = "svchost.exe", AppPath = @"C:\Windows\System32\svchost.exe" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Listening", LocalIp = "::", LocalPort = 3389, Pid = 1100, ProcessName = "svchost.exe", AppPath = @"C:\Windows\System32\svchost.exe" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Listening", LocalIp = "0.0.0.0", LocalPort = 445, Pid = 4, ProcessName = "System", AppPath = AppPaths.SystemApp },
+        new ActiveEndpoint { Protocol = "TCP", State = "Listening", LocalIp = "0.0.0.0", LocalPort = 5900, Pid = 2200, ProcessName = "tvnserver.exe", AppPath = @"C:\Program Files\TightVNC\tvnserver.exe" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Listening", LocalIp = "127.0.0.1", LocalPort = 14147, Pid = 3300, ProcessName = "filezilla-server.exe", AppPath = @"C:\Program Files\FileZilla Server\filezilla-server.exe" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Listening", LocalIp = "0.0.0.0", LocalPort = 49668, Pid = 700, ProcessName = "lsass.exe", AppPath = @"C:\Windows\System32\lsass.exe" },
+        new ActiveEndpoint { Protocol = "UDP", State = "Bound", LocalIp = "0.0.0.0", LocalPort = 5353, Pid = 1500, ProcessName = "svchost.exe", AppPath = @"C:\Windows\System32\svchost.exe", RemoteIp = "*" },
+        new ActiveEndpoint { Protocol = "UDP", State = "Bound", LocalIp = "0.0.0.0", LocalPort = 68, Pid = 1600, ProcessName = "svchost.exe", AppPath = @"C:\Windows\System32\svchost.exe", RemoteIp = "*" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Established", LocalIp = "192.168.1.5", LocalPort = 5900, RemoteIp = "192.168.1.20", RemotePort = 51000, Pid = 2200, ProcessName = "tvnserver.exe", AppPath = @"C:\Program Files\TightVNC\tvnserver.exe" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Established", LocalIp = "192.168.1.5", LocalPort = 5900, RemoteIp = "192.168.1.31", RemotePort = 51001, Pid = 2200, ProcessName = "tvnserver.exe", AppPath = @"C:\Program Files\TightVNC\tvnserver.exe" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Established", LocalIp = "127.0.0.1", LocalPort = 14147, RemoteIp = "127.0.0.1", RemotePort = 52000, Pid = 3300, ProcessName = "filezilla-server.exe" },
+        new ActiveEndpoint { Protocol = "TCP", State = "Established", LocalIp = "192.168.1.5", LocalPort = 50123, RemoteIp = "142.250.1.1", RemotePort = 443, Pid = 4000, ProcessName = "browser.exe" },
+    };
+
+    internal static List<FirewallEvent> SamplePortEvents()
+    {
+        var now = DateTime.UtcNow;
+        FirewallEvent In(string ip, int port, Verdict v, string app, int ago) => new FirewallEvent
+        {
+            TimeUtc = now.AddMinutes(-ago), Verdict = v, Direction = TrafficDirection.Inbound, Protocol = "TCP", LocalIp = "192.168.1.5", LocalPort = port, RemoteIp = ip, RemotePort = 40000, AppPath = app
+        };
+        return new List<FirewallEvent>
+        {
+            In("185.220.101.4", 3389, Verdict.Blocked, @"C:\Windows\System32\svchost.exe", 3),
+            In("185.220.101.4", 3389, Verdict.Blocked, @"C:\Windows\System32\svchost.exe", 2),
+            In("45.9.20.11", 3389, Verdict.Blocked, @"C:\Windows\System32\svchost.exe", 20),
+            In("192.168.1.20", 5900, Verdict.Accepted, @"C:\Program Files\TightVNC\tvnserver.exe", 1),
+            In("192.168.1.44", 5900, Verdict.Blocked, @"C:\Program Files\TightVNC\tvnserver.exe", 9),
+            In("192.168.1.44", 445, Verdict.Blocked, AppPaths.SystemApp, 5),
+            In("192.168.1.20", 9999, Verdict.Blocked, @"C:\x.exe", 1),
+        };
+    }
+
+    private static void PortsAndShares()
+    {
+        var rows = PortsView.Build(SampleEndpoints(), SamplePortEvents());
+        var rdp = rows.Single(r => r.Port == 3389);
+        Check(rows.Count == 7, "one row per program and port, IPv4 and IPv6 together: " + rows.Count);
+        Check(rdp.Binds.SequenceEqual(new[] { "0.0.0.0", "::" }) && rdp.ScopeText == "All networks" && rdp.Service == "Remote Desktop", "binds, scope and service name");
+        Check(rdp.Visitors["185.220.101.4"].Blocked == 2 && rdp.Visitors.Count == 2 && rdp.ConnectedNow.Count == 0, "attempts in the last hour per address");
+        var vnc = rows.Single(r => r.Port == 5900);
+        Check(vnc.ConnectedNow.SequenceEqual(new[] { "192.168.1.20", "192.168.1.31" }) && vnc.Visitors["192.168.1.20"].ConnectedNow && vnc.Visitors["192.168.1.20"].Accepted == 1
+              && vnc.Visitors["192.168.1.44"].Blocked == 1, "who's connected now and who tried");
+        var fz = rows.Single(r => r.Port == 14147);
+        Check(fz.LocalOnly && fz.ScopeText == "This PC only" && fz.ConnectedNow.Count == 0 && rows.Last() == fz, "loopback-only ports can't be reached, and list last");
+        Check(rows.Single(r => r.Port == 49668).Service == "Dynamic (Windows RPC)" && rows.Single(r => r.Port == 5353).Service == "mDNS (Bonjour)", "port names");
+        Check(!rows.Any(r => r.Port == 50123), "outgoing connections aren't open ports");
+        Check(PortNames.Name("TCP", 1234, "app.exe") == "" && PortNames.Name("UDP", 68, null) == "DHCP", "unknown and UDP names");
+    }
+
+    private static void BandwidthTests()
+    {
+        var m = new BandwidthMeter();
+        var t = new DateTime(2026, 11, 21, 10, 0, 0, DateTimeKind.Utc);
+        (string, string) Resolve(int pid) => pid == 1 ? (@"C:\b\browser.exe", "browser.exe") : pid == 2 ? (@"C:\n\nas.exe", "nas.exe") : (null, null);
+        m.Sample(t, Resolve);
+        System.Threading.Tasks.Parallel.For(0, 1000, i => m.Add(1, "8.8.8.8", false, 125));
+        m.Add(1, "8.8.8.8", true, 12_500);
+        m.Add(1, "10.20.30.40", false, 1_000);
+        m.Add(2, "192.168.1.20", false, 250_000);
+        m.Add(2, "192.168.1.20", true, 2_500);
+        m.Add(2, "239.255.255.250", true, 500);
+        m.Add(3, "127.0.0.1", false, 9_999_999);
+        m.Add(2, "192.168.1.20", false, 0);
+        m.Sample(t.AddSeconds(2), Resolve);
+        var browser = m.Apps.Single(a => a.Name == "browser.exe");
+        var nas = m.Apps.Single(a => a.Name == "nas.exe");
+        Check(Math.Abs(browser.InternetDown - (125_000 + 1_000) * 8 / 2.0) < 0.01 && Math.Abs(browser.InternetUp - 12_500 * 8 / 2.0) < 0.01 && browser.LanDown == 0,
+            "bytes from many threads become bits per second; a private address off the LAN counts as internet");
+        Check(Math.Abs(nas.LanDown - 1_000_000) < 0.01 && Math.Abs(nas.LanUp - (2_500 + 500) * 4) < 0.01 && nas.InternetDown == 0, "the adapters' subnet and local discovery are LAN");
+        Check(m.Apps.Count == 2 && m.Apps[0] == nas, "this PC talking to itself is left out; busiest first");
+        Check(Math.Abs(m.Now.Down - (126_000 + 250_000) * 4) < 0.01 && Math.Abs(m.Now.InternetUp - 50_000) < 0.01 && Math.Abs(m.Now.LanDown - 1_000_000) < 0.01, "totals for the PC, internet and LAN");
+        m.Sample(t.AddSeconds(3), Resolve);
+        Check(m.Now.Down == 0 && browser.Down == 0 && browser.TotalDown == 126_000 && nas.TotalUp == 3_000, "rates drop to zero when quiet; totals stay");
+        for (var i = 0; i < BandwidthMeter.HistorySeconds + 50; i++) m.Sample(t.AddSeconds(4 + i), Resolve);
+        Check(m.History.Count == BandwidthMeter.HistorySeconds, "the graph keeps 10 minutes");
+        Check(BandwidthMeter.Text(12_400_000) == "12.4 Mb/s" && BandwidthMeter.Text(830_000) == "830 kb/s" && BandwidthMeter.Text(0) == "0 b/s" && BandwidthMeter.Text(1.5e9) == "1.50 Gb/s",
+            "rate text");
+        Check(BandwidthMeter.Bytes(126_000) == "123 KB" && BandwidthMeter.Bytes(3L << 30) == "3.0 GB", "size text");
+
+        // One event of each kind, laid out as Windows hands it over (64-bit EVENT_RECORD).
+        var record = System.Runtime.InteropServices.Marshal.AllocHGlobal(112);
+        var data = System.Runtime.InteropServices.Marshal.AllocHGlobal(64);
+        try
+        {
+            void Event(ushort id, byte[] payload)
+            {
+                for (var i = 0; i < 112; i++) System.Runtime.InteropServices.Marshal.WriteByte(record, i, 0);
+                System.Runtime.InteropServices.Marshal.WriteInt16(record, 40, (short)id);
+                System.Runtime.InteropServices.Marshal.WriteInt16(record, 86, (short)payload.Length);
+                System.Runtime.InteropServices.Marshal.Copy(payload, 0, data, payload.Length);
+                System.Runtime.InteropServices.Marshal.WriteIntPtr(record, 96, data);
+            }
+            byte[] V4(int pid, int size, byte[] d, byte[] s) => BitConverter.GetBytes(pid).Concat(BitConverter.GetBytes(size)).Concat(d).Concat(s).Concat(new byte[] { 1, 187, 200, 0 }).ToArray();
+            var local = new HashSet<string> { "192.168.1.5", "2001:db8::5" };
+
+            Event(10, V4(4321, 1460, new byte[] { 8, 8, 8, 8 }, new byte[] { 192, 168, 1, 5 }));
+            Check(EasyFW.Platform.NetTrace.TryParse(record, local, out var pid, out var remote, out var sent, out var size) && pid == 4321 && size == 1460 && remote == "8.8.8.8" && sent,
+                "TCP sent over IPv4");
+            Event(43, V4(77, 512, new byte[] { 192, 168, 1, 5 }, new byte[] { 192, 168, 1, 20 }));
+            Check(EasyFW.Platform.NetTrace.TryParse(record, local, out pid, out remote, out sent, out size) && remote == "192.168.1.20" && !sent && size == 512,
+                "UDP received; the remote end is whichever isn't this PC");
+            var v6 = BitConverter.GetBytes(9).Concat(BitConverter.GetBytes(100)).Concat(System.Net.IPAddress.Parse("2606:4700::1111").GetAddressBytes())
+                .Concat(System.Net.IPAddress.Parse("2001:db8::5").GetAddressBytes()).Concat(new byte[] { 0, 80, 1, 2 }).ToArray();
+            Event(27, v6);
+            Check(EasyFW.Platform.NetTrace.TryParse(record, local, out pid, out remote, out sent, out size) && remote == "2606:4700::1111" && !sent && pid == 9, "TCP received over IPv6");
+            Event(12, V4(1, 0, new byte[] { 8, 8, 8, 8 }, new byte[] { 192, 168, 1, 5 }));
+            Check(!EasyFW.Platform.NetTrace.TryParse(record, local, out _, out _, out _, out _), "connects and other events carry no data");
+            Event(10, new byte[8]);
+            Check(!EasyFW.Platform.NetTrace.TryParse(record, local, out _, out _, out _, out _), "a short event is skipped");
+        }
+        finally
+        {
+            System.Runtime.InteropServices.Marshal.FreeHGlobal(record);
+            System.Runtime.InteropServices.Marshal.FreeHGlobal(data);
+        }
+
+        // Without administrator rights Windows refuses the session: that must be reported, not thrown.
+        var meter = new BandwidthMeter();
+        using (var trace = new EasyFW.Platform.NetTrace(meter))
+        {
+            trace.Start();
+            var elevated = new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent()).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            Check(elevated ? meter.Running || meter.Problem != null : meter.Problem != null && !meter.Running, "starting reports its problem: " + (meter.Problem ?? "running"));
+        }
+    }
+
+    private static void WorldMap()
+    {
+        var places = new (double Lon, double Lat, bool Land, string Name)[]
+        {
+            (10, 50, true, "Germany"), (-100, 40, true, "the US"), (135, -25, true, "Australia"), (20, 0, true, "the Congo"), (78, 22, true, "India"),
+            (-55, -10, true, "Brazil"), (100, 60, true, "Siberia"), (31, 27, true, "Egypt"), (-2, 53, true, "Britain"),
+            (-30, 30, false, "the Atlantic"), (0, 0, false, "the Gulf of Guinea"), (-140, 10, false, "the Pacific"), (34, 43, false, "the Black Sea"),
+            (51, 42, false, "the Caspian"), (88, -20, false, "the Indian Ocean"), (18, 35, false, "the Mediterranean"), (20, 58, false, "the Baltic"),
+        };
+        foreach (var p in places)
+        {
+            Check(WorldGeo.IsLand(p.Lon, p.Lat) == p.Land, $"map: {p.Name} is {(p.Land ? "land" : "sea")}");
+            Check(WorldGeo.IsLandFast(p.Lon, p.Lat) == p.Land, $"map grid: {p.Name} is {(p.Land ? "land" : "sea")}");
+        }
+        Check(WorldGeo.TryLocate("us", out var lat, out var lon) && lat > 25 && lat < 50 && lon < -70, "countries have a place, any case");
+        Check(!WorldGeo.TryLocate("LAN", out _, out _) && !WorldGeo.TryLocate(null, out _, out _), "LAN and unknown have none");
+        Check(WorldGeo.Nearest(51, 10) == "DE" && WorldGeo.Nearest(-34, 151) == "AU", "nearest country to a point");
+        var misplaced = WorldGeo.Countries.Where(c => WorldGeo.TryLocate(c, out var a, out var o) && (a > WorldGeo.North || a < WorldGeo.South)).ToList();
+        Check(misplaced.Count == 0, "every country is on the map: " + string.Join(",", misplaced));
+
+        var now = DateTime.UtcNow;
+        string Country(string ip) => ip.StartsWith("192.168.") ? "LAN" : ip.StartsWith("1.") ? "US" : ip.StartsWith("2.") ? "CN" : ip.StartsWith("3.") ? "ZZ-unknown" : null;
+        FirewallEvent E(string ip, Verdict v, TrafficDirection d, double minutesAgo, string app = @"C:\a.exe")
+        {
+            var e = Blocked(app, d, ip);
+            e.Verdict = v;
+            e.TimeUtc = now.AddMinutes(-minutesAgo);
+            return e;
+        }
+        var events = new List<FirewallEvent>
+        {
+            E("1.0.0.1", Verdict.Accepted, TrafficDirection.Outbound, 1),
+            E("1.0.0.2", Verdict.Accepted, TrafficDirection.Outbound, 2, @"C:\b.exe"),
+            E("1.0.0.1", Verdict.Blocked, TrafficDirection.Inbound, 3),
+            E("2.0.0.1", Verdict.Blocked, TrafficDirection.Inbound, 1),
+            E("2.0.0.1", Verdict.Accepted, TrafficDirection.Inbound, 1),
+            E("192.168.1.9", Verdict.Accepted, TrafficDirection.Outbound, 1),
+            E("3.0.0.1", Verdict.Accepted, TrafficDirection.Outbound, 1),
+            E("9.0.0.1", Verdict.Accepted, TrafficDirection.Outbound, 1),
+            E("1.0.0.1", Verdict.Accepted, TrafficDirection.Outbound, 20),
+            E("127.0.0.1", Verdict.Accepted, TrafficDirection.Outbound, 1),
+        };
+        var open = new List<ConnectionEntry>
+        {
+            new ConnectionEntry { RemoteIp = "1.0.0.9", LocalIp = "192.168.1.5", Direction = TrafficDirection.Outbound, IsActive = true, AppPath = @"C:\a.exe" },
+            new ConnectionEntry { RemoteIp = "2.0.0.9", LocalIp = "192.168.1.5", Direction = TrafficDirection.Inbound, IsActive = true },
+            new ConnectionEntry { RemoteIp = "2.0.0.8", LocalIp = "192.168.1.5", Direction = TrafficDirection.Inbound, IsActive = false },
+        };
+        var snap = GeoTraffic.Build(events, open, now.AddMinutes(-5), now, true, Country);
+        var us = snap.Countries.Single(c => c.Country == "US");
+        var cn = snap.Countries.Single(c => c.Country == "CN");
+        Check(snap.Countries.Count == 2 && snap.Countries[0] == us, "countries busiest first");
+        Check(us.OutAccepted == 2 && us.InBlocked == 1 && us.ActiveOut == 1 && us.Out == 3 && us.Total == 4, "a country counts out, in, blocked and open");
+        Check(cn.InBlocked == 1 && cn.InAccepted == 1 && cn.ActiveIn == 1 && cn.Active == 1, "closed connections aren't open");
+        Check(snap.Lan == 1 && snap.Unknown == 2, "LAN and unplaced addresses are counted aside, loopback is ignored");
+        Check(us.Ips.Count == 3 && us.TopApps(1).Single() == "a.exe", "addresses and busiest app");
+        Check(snap.Out == 3 && snap.In == 2 && snap.Blocked == 2 && snap.Active == 2, "totals");
+
+        var back = GeoTraffic.Build(events, null, now.AddMinutes(-25), now.AddMinutes(-15), false, Country);
+        Check(back.Countries.Single().OutAccepted == 1 && back.Active == 0 && !back.Live, "looking back takes only that window");
+
+        var tl = GeoTraffic.Timeline(events, now, TimeSpan.FromMinutes(30), 30, Country);
+        Check(tl.Length == 30 && tl.Sum(b => b.Total) == 8, "timeline leaves out LAN and loopback");
+        Check(tl[29].Total >= 1 && tl[10].Out == 1, "timeline puts each attempt in its minute");
+        Check(tl.Sum(b => b.Blocked) == 2 && tl.Sum(b => b.In) == 1, "timeline splits blocked, in and out");
+
+        var s = NewService(new FakeBackend());
+        s.SetMapHome("jp");
+        Check(s.MapHome == "JP", "chosen location");
+        s.SetMapHome("nowhere");
+        Check(s.MapHome == (WorldGeo.HomeFromWindows() ?? "DE"), "an unknown location falls back to the Windows region");
+    }
+
+    private static void HistoryAndInternet()
+    {
+        Check(NetRanges.IsInternet("8.8.8.8") && NetRanges.IsInternet("2001:4860::8888"), "public addresses are internet");
+        Check(!NetRanges.IsInternet("192.168.1.9") && !NetRanges.IsInternet("10.0.0.1") && !NetRanges.IsInternet("127.0.0.1")
+              && !NetRanges.IsInternet("224.0.0.251") && !NetRanges.IsInternet("fe80::1") && !NetRanges.IsInternet("") && !NetRanges.IsInternet("*"), "LAN, loopback and multicast aren't");
+        Check(NetRanges.Allows(false, LanAccess.All, null, "192.168.1.9") && !NetRanges.Allows(false, LanAccess.All, null, "8.8.8.8")
+              && NetRanges.Allows(false, LanAccess.All, null, "192.168.1.9") && NetRanges.Allows(true, LanAccess.None, null, "8.8.8.8")
+              && !NetRanges.Allows(true, LanAccess.None, null, "192.168.1.9"), "cached range checks still answer right");
+
+        var h = new EventHistory(5);
+        var now = DateTime.UtcNow;
+        var old = Blocked(@"C:\a.exe");
+        old.TimeUtc = now.AddMinutes(-61);
+        h.Add(old);
+        for (var i = 0; i < 3; i++) h.Add(Blocked(@"C:\a.exe"));
+        h.Add(Blocked(@"C:\b.exe"));
+        var ping = Blocked(AppPaths.SystemApp);
+        ping.Protocol = "ICMP";
+        h.Add(ping);
+        Check(h.ForApp(@"C:\A.exe", now).Count == 3, "history keeps the last hour, any case");
+        Check(h.ForApp(AppPaths.PingApp, now).Count == 1, "pings are found under Ping (ICMP)");
+        Check(h.Count == 5, "history is capped");
+
+        var s = NewService(new FakeBackend());
+        var lan = Blocked(@"C:\lan.exe", remote: "192.168.1.20");
+        var net = Blocked(@"C:\net.exe");
+        net.Verdict = Verdict.Accepted;
+        s.ProcessEvents(new[] { lan, net });
+        Check(!s.UsesInternet(@"C:\lan.exe") && s.UsesInternet(@"C:\NET.exe"), "internet use is tracked per app, accepted or blocked");
+        Check(s.Config.InternetApps.Count == 1 && s.History.ForApp(@"C:\lan.exe", DateTime.UtcNow).Count == 1, "saved and logged");
+        var store = new ConfigStore(null, true);
+        store.Config.InternetApps.Add(@"C:\x.exe");
+        Check(new FirewallService(store, new FakeBackend(), RunMode.Live).UsesInternet(@"c:\x.exe"), "internet use survives a restart");
+    }
+
     private static void Pending()
     {
         var b = new FakeBackend();
@@ -870,8 +1692,13 @@ internal static class Tests
         foreach (var bad in new[] { "", "hello", "10.1/16", "192.168.1.0/33", "192.168.1.0/-1", "192.168.1.0/", "fe80::1%3/64", "1.2.3.4/24/1" })
             Check(!NetRanges.TryNormalize(bad, out _), "refuses subnet " + bad);
 
-        Check(NetRanges.IsLan("192.168.1.5") && NetRanges.IsLan("10.20.30.40") && NetRanges.IsLan("172.31.0.1") && NetRanges.IsLan("169.254.3.3"), "private ranges are LAN");
-        Check(NetRanges.IsLan("239.255.255.250") && NetRanges.IsLan("255.255.255.255") && NetRanges.IsLan("fe80::1") && NetRanges.IsLan("fd00::5"), "discovery and IPv6 LAN");
+        // The tests' LAN is 192.168.1.0/24 (Wi-Fi) and 10.0.0.0/24 (Ethernet).
+        Check(NetRanges.IsLan("192.168.1.5") && NetRanges.IsLan("10.0.0.40") && NetRanges.IsLan("169.254.3.3"), "the adapters' subnets and link-local are LAN");
+        Check(!NetRanges.IsLan("10.20.30.40") && !NetRanges.IsLan("172.31.0.1") && !NetRanges.IsLan("192.168.2.1") && !NetRanges.IsLan("fd00::5"),
+            "other private addresses, such as across a VPN, aren't LAN");
+        Check(NetRanges.IsInternet("10.20.30.40") && NetRanges.IsInternet("fd00::5") && !NetRanges.IsInternet("10.0.0.40") && !NetRanges.IsInternet("127.0.0.1"), "and count as internet");
+        Check(NetRanges.IsLan("239.255.255.250") && NetRanges.IsLan("255.255.255.255") && NetRanges.IsLan("fe80::1"), "discovery and link-local IPv6 are LAN");
+        Check(!NetRanges.IsPublicAddress("10.20.30.40") && NetRanges.IsPublicAddress("8.8.8.8"), "the strict public test doesn't follow the network");
         Check(!NetRanges.IsLan("8.8.8.8") && !NetRanges.IsLan("172.32.0.1") && !NetRanges.IsLan("2001:4860::8888"), "public addresses aren't LAN");
 
         var lanOnly = new AppRule { AppPath = @"C:\nas.exe", NoInternet = true };
@@ -880,12 +1707,37 @@ internal static class Tests
         Check(lanOnly.AllowsAddress("::ffff:192.168.1.9") && !lanOnly.AllowsAddress("::ffff:8.8.8.8"), "IPv4 written as IPv6 reads as IPv4");
         Check(lanOnly.AllowsAddress("*"), "an address that can't be read is left to the firewall");
         var addresses = lanOnly.RemoteAddresses;
-        Check(addresses.Contains("192.168.0.0-192.168.255.255") && addresses.Contains("10.0.0.0-10.255.255.255") && addresses.Contains("fe80::-febf:") && !addresses.Contains("8.8."), "LAN ranges for Windows");
+        Check(addresses.Contains("192.168.1.0-192.168.1.255") && addresses.Contains("10.0.0.0-10.0.0.255") && addresses.Contains("fe80::-febf:")
+              && !addresses.Contains("10.255.255.255") && !addresses.Contains("8.8."), "LAN ranges for Windows: " + addresses);
 
         var internetOnly = new AppRule { AppPath = @"C:\web.exe", Lan = LanAccess.None };
         Check(internetOnly.NetworkText == "Internet only" && internetOnly.AllowsAddress("8.8.8.8") && internetOnly.AllowsAddress("2001:4860::8888"), "internet only reaches the internet");
-        Check(!internetOnly.AllowsAddress("192.168.1.9") && !internetOnly.AllowsAddress("239.255.255.250") && !internetOnly.AllowsAddress("fd00::5"), "internet only stays off the LAN");
-        Check(internetOnly.RemoteAddresses.StartsWith("1.0.0.0-9.255.255.255,11.0.0.0-126.255.255.255,") && internetOnly.RemoteAddresses.EndsWith(",2000::-3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), "internet ranges for Windows");
+        Check(!internetOnly.AllowsAddress("192.168.1.9") && !internetOnly.AllowsAddress("239.255.255.250") && !internetOnly.AllowsAddress("fe80::5")
+              && internetOnly.AllowsAddress("10.20.30.40"), "internet only stays off the LAN");
+        Check(internetOnly.RemoteAddresses.StartsWith("1.0.0.0-9.255.255.255,10.0.1.0-126.255.255.255,") && internetOnly.RemoteAddresses.EndsWith(",fec0::-feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+            "internet ranges for Windows: " + internetOnly.RemoteAddresses);
+
+        Check(NetRanges.IsLanAdapter(System.Net.NetworkInformation.NetworkInterfaceType.Wireless80211, "Wi-Fi", "Intel Wi-Fi 6 AX201")
+              && NetRanges.IsLanAdapter(System.Net.NetworkInformation.NetworkInterfaceType.Ethernet, "Ethernet", "Realtek PCIe GbE")
+              && !NetRanges.IsLanAdapter(System.Net.NetworkInformation.NetworkInterfaceType.Ethernet, "vEthernet (Default Switch)", "Hyper-V Virtual Ethernet Adapter")
+              && !NetRanges.IsLanAdapter(System.Net.NetworkInformation.NetworkInterfaceType.Ethernet, "Ethernet 2", "TAP-Windows Adapter V9")
+              && !NetRanges.IsLanAdapter(System.Net.NetworkInformation.NetworkInterfaceType.Ppp, "VPN", "WAN Miniport")
+              && !NetRanges.IsLanAdapter(System.Net.NetworkInformation.NetworkInterfaceType.Loopback, "Loopback", ""), "only real Ethernet and Wi-Fi adapters make the LAN");
+
+        var source = NetRanges.AdapterSource;
+        var before = NetRanges.Version;
+        try
+        {
+            NetRanges.AdapterSource = () => new List<(string, string)> { ("192.168.50.0/24", "Wi-Fi") };
+            NetRanges.Refresh();
+            Check(NetRanges.Version != before && NetRanges.IsLan("192.168.50.7") && !NetRanges.IsLan("192.168.1.5") && NetRanges.IsInternet("192.168.1.5"), "joining another network moves the LAN");
+            Check(lanOnly.AllowsAddress("192.168.50.7") && !lanOnly.AllowsAddress("192.168.1.5"), "rules follow it");
+        }
+        finally
+        {
+            NetRanges.AdapterSource = source;
+            NetRanges.Refresh();
+        }
 
         var some = new AppRule { AppPath = @"C:\cam.exe", NoInternet = true, Lan = LanAccess.Selected, LanSubnets = new List<string> { "192.168.1.0/24" } };
         Check(some.AllowsAddress("192.168.1.50") && !some.AllowsAddress("192.168.2.50") && !some.AllowsAddress("8.8.8.8") && some.AllowsAddress("239.255.255.250"), "only the chosen subnet, plus discovery");
@@ -1247,6 +2099,10 @@ internal static class Tests
         Wait(service.SaveRuleAsync(new AppRule { AppPath = @"C:\Tools\Mail\mail.exe", Action = RuleAction.Block, Ports = "25" }));
         var lanApp = new AppRule { AppPath = @"C:\Tools\SyncAgent\syncagent.exe", NoInternet = true, Lan = LanAccess.Selected, LanSubnets = new List<string> { "192.168.1.0/24" } };
         Wait(service.SaveRuleAsync(lanApp));
+        Wait(service.DecideAsync(@"C:\Tools\Chat\chat.exe", RuleAction.Allow, null, RuleDuration.Minutes30));
+        Wait(service.DecideAsync(@"C:\Tools\Remote\remote.exe", RuleAction.Allow, null, RuleDuration.UntilRestart));
+        Wait(service.SaveRuleAsync(new AppRule { AppPath = @"C:\Games\Arcade\arcade.exe", ScheduleDays = 0b1000001, ScheduleFrom = 10 * 60, ScheduleTo = 20 * 60, KeepInLockdown = false }));
+        service.Config.Rules.First(r => r.AppPath.EndsWith("browser.exe")).KeepInLockdown = true;
         queue.Clear();
         for (var i = 0; i < 60; i++) demo.EmitOne();
         service.ProcessEvents(queue);
@@ -1264,7 +2120,139 @@ internal static class Tests
         form.RefreshLive();
         Snap(form, Path.Combine(dir, "top.png"));
         form.ShowRequests();
+        ready = DateTime.UtcNow.AddSeconds(10);
+        while (service.Config.Rules.Any(r => AppSignature.Text(r.AppPath) == "") && DateTime.UtcNow < ready) { Application.DoEvents(); System.Threading.Thread.Sleep(50); }
+        form.RefreshLive();
         Snap(form, Path.Combine(dir, "rules.png"));
+        var rulesTab = form.GetType().GetFields(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .Select(f => f.GetValue(form)).OfType<RulesTab>().First();
+        service.Config.Pending.Add(new PendingRequest { AppPath = @"C:\Tools\Printer\printsvc.exe", SawInbound = true, LastRemote = "192.168.1.20:5353", LastProtocol = "UDP", Attempts = 4, FirstSeenUtc = DateTime.UtcNow, LastSeenUtc = DateTime.UtcNow });
+        typeof(RulesTab).GetMethod("SortPendingBy", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).Invoke(rulesTab, new object[] { 4 });
+        Snap(form, Path.Combine(dir, "rules-sorted.png"));
+        // Half an hour of traffic from around the world, for the map and its timeline.
+        var world = new[] { "8.8.8.8", "13.107.4.50", "93.184.216.34", "77.88.8.8", "114.114.114.114", "210.130.1.1", "168.126.63.1", "200.160.2.3",
+                            "196.25.1.1", "62.210.0.1", "194.25.0.60", "1.1.1.1", "185.60.216.35", "103.21.244.1", "41.231.53.1", "189.38.95.95" };
+        var rnd = new Random(7);
+        var apps = new[] { @"C:\Program Files\Browser\browser.exe", @"C:\Windows\System32\svchost.exe", @"C:\Tools\Sync\sync.exe", @"C:\Games\GameLauncher\launcher.exe" };
+        var t0 = DateTime.UtcNow;
+        var past = new List<FirewallEvent>();
+        for (var i = 0; i < 1400; i++)
+        {
+            var ip = world[(int)(Math.Pow(rnd.NextDouble(), 1.8) * world.Length)];
+            var roll = rnd.NextDouble();
+            past.Add(new FirewallEvent
+            {
+                TimeUtc = t0.AddSeconds(-rnd.Next(0, 1800) * (0.4 + 0.6 * rnd.NextDouble())), AppPath = apps[rnd.Next(apps.Length)], Protocol = "TCP",
+                Verdict = roll < 0.18 ? Verdict.Blocked : Verdict.Accepted,
+                Direction = roll < 0.12 || (roll > 0.8 && roll < 0.92) ? TrafficDirection.Inbound : TrafficDirection.Outbound,
+                LocalIp = "192.168.1.5", LocalPort = 50000 + i, RemoteIp = ip, RemotePort = 443
+            });
+        }
+        foreach (var e in past.OrderBy(e => e.TimeUtc)) service.History.Add(e);
+        WorldMapTab.AskForLocation = false;
+        PublicIp.Set("194.25.0.60");
+        service.SetMapHome(null);
+        form.ShowMap();
+        form.RefreshLive();
+        Snap(form, Path.Combine(dir, "map.png"));
+        var mapTab = form.GetType().GetFields(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .Select(f => f.GetValue(form)).OfType<WorldMapTab>().First();
+        mapTab.WindowMinutes = 15;
+        mapTab.Offset = 12;
+        Snap(form, Path.Combine(dir, "map-replay.png"));
+        using (var where = new LocationForm(service.Location, PublicIp.Address, PublicIp.Country))
+        {
+            Offscreen(where);
+            where.Show();
+            Snap(where, Path.Combine(dir, "location.png"));
+        }
+        Snap(form, Path.Combine(dir, "header-ip.png"));
+        using (var c = new CountryBlockForm(new[] { "CN", "RU" })) { Offscreen(c); c.Show(); Snap(c, Path.Combine(dir, "countries.png")); }
+        using (var l = new LockdownForm(service.Config.Rules, true)) { Offscreen(l); l.Show(); Snap(l, Path.Combine(dir, "lockdown.png")); }
+        service.LastEndpoints = SampleEndpoints();
+        foreach (var e in SamplePortEvents()) service.History.Add(e);
+        PortsTab.ShareReader = () =>
+        {
+            var music = new ShareInfo { Name = "Music", Path = @"D:\Music", Type = "Folder", Description = "Family music" };
+            music.Users.Add(new ShareUser { Computer = "192.168.1.31", User = @"LIVINGROOM\tv", Files = 2 });
+            return new List<ShareInfo>
+            {
+                music,
+                new ShareInfo { Name = "Scans", Path = @"C:\Users\Public\Scans", Type = "Folder" },
+                new ShareInfo { Name = "C$", Path = @"C:\", Type = "Folder", Description = "Default share", IsAdmin = true },
+                new ShareInfo { Name = "IPC$", Path = "", Type = "Remote control (IPC)", Description = "Remote IPC", IsAdmin = true },
+            };
+        };
+        form.ShowPorts();
+        form.RefreshLive();
+        for (var i = 0; i < 20; i++) { Application.DoEvents(); System.Threading.Thread.Sleep(50); }
+        form.RefreshLive();
+        Snap(form, Path.Combine(dir, "ports-tab.png"));
+        {
+            var meter = service.Bandwidth;
+            meter.Running = true;
+            var rr = new Random(11);
+            var start = DateTime.UtcNow.AddSeconds(-120);
+            (string, string) Who(int pid) => pid == 1 ? (@"C:\Program Files\Browser\browser.exe", "browser.exe") : pid == 2 ? (@"C:\Tools\Sync\sync.exe", "sync.exe")
+                : pid == 3 ? (@"C:\Program Files\TightVNC\tvnserver.exe", "tvnserver.exe") : pid == 4 ? (@"C:\Tools\Backup\backup.exe", "backup.exe") : (@"C:\Windows\System32\svchost.exe", "svchost.exe");
+            meter.Sample(start, Who);
+            for (var sec = 1; sec <= 120; sec++)
+            {
+                var wave = 1 + Math.Sin(sec / 9.0);
+                meter.Add(1, "142.250.180.14", false, (int)(700_000 * wave + rr.Next(200_000)));
+                meter.Add(1, "142.250.180.14", true, 30_000 + rr.Next(20_000));
+                meter.Add(2, "192.168.1.20", false, sec > 40 && sec < 95 ? 2_200_000 + rr.Next(400_000) : 20_000);
+                meter.Add(3, "192.168.1.31", true, 600_000 + rr.Next(500_000));
+                meter.Add(4, "93.184.216.34", true, sec > 70 ? 350_000 + rr.Next(100_000) : 0);
+                meter.Add(5, "13.107.4.50", false, 15_000 + rr.Next(10_000));
+                meter.Sample(start.AddSeconds(sec), Who);
+            }
+        }
+        form.ShowBandwidth();
+        form.RefreshLive();
+        Snap(form, Path.Combine(dir, "bandwidth.png"));
+        using (var bl = new BlocklistForm(service)) { Offscreen(bl); bl.Show(); Snap(bl, Path.Combine(dir, "blocklists.png")); }
+        using (var pw = new PasswordSetForm(service)) { Offscreen(pw); pw.Show(); Snap(pw, Path.Combine(dir, "password.png")); }
+        using (var ed = new RuleEditForm(service.Config.Rules.First(r => r.AppPath.EndsWith("arcade.exe")))) { Offscreen(ed); ed.Show(); Snap(ed, Path.Combine(dir, "edit-hours.png")); }
+        Wait(service.SetLockdownAsync(true));
+        form.RefreshStatus();
+        form.ShowRequests();
+        form.RefreshLive();
+        Snap(form, Path.Combine(dir, "lockdown-on.png"));
+        Wait(service.SetLockdownAsync(false));
+        mapTab.Offset = 0;
+        mapTab.WindowMinutes = 5;
+
+
+        service.SavePattern(new PatternRule { Pattern = @"C:\Games\*.*", Action = RuleAction.Allow, Notes = "Everything in the games folder" });
+        service.SavePattern(new PatternRule { Pattern = "updater", Action = RuleAction.Block });
+        using (var patterns = new PatternsForm(service))
+        {
+            Offscreen(patterns);
+            patterns.Show();
+            Snap(patterns, Path.Combine(dir, "patterns.png"));
+        }
+        using (var patternEdit = new PatternEditForm(service, service.Config.Patterns[0]))
+        {
+            Offscreen(patternEdit);
+            patternEdit.Show();
+            Snap(patternEdit, Path.Combine(dir, "pattern-edit.png"));
+        }
+        var busiest = service.Connections.Query(new ConnectionFilter(), ConnectionColumn.Hits, false).First();
+        using (var log = new AppLogForm(service, AppPaths.RuleTarget(busiest.AppPath, busiest.Protocol)))
+        {
+            Offscreen(log);
+            log.Show();
+            Snap(log, Path.Combine(dir, "applog.png"));
+        }
+        // Time and Status moved right, Country first, so the first column and the flag column are both out of place.
+        service.SaveColumns("applog", new[] { 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 0 }, null);
+        using (var moved = new AppLogForm(service, AppPaths.RuleTarget(busiest.AppPath, busiest.Protocol)))
+        {
+            Offscreen(moved);
+            moved.Show();
+            Snap(moved, Path.Combine(dir, "applog-reordered.png"));
+        }
 
         using (var edit = new RuleEditForm(service.FindRule(lanApp.AppPath)))
         {

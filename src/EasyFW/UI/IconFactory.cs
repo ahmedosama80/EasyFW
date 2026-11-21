@@ -70,6 +70,8 @@ namespace EasyFW.UI
         public static readonly Color Off = Color.FromArgb(185, 28, 28);
         public static readonly Color Blocked = Color.FromArgb(185, 28, 28);
         public static readonly Color BlockedRow = Color.FromArgb(254, 242, 242);
+        /// <summary>Very light blue behind requests from or to the local network.</summary>
+        public static readonly Color LanRow = Color.FromArgb(238, 245, 255);
         public static readonly Color Closed = Color.FromArgb(107, 114, 128);
         public static readonly Color Header = Color.FromArgb(248, 250, 252);
         public static readonly Color BannerBack = Color.FromArgb(254, 243, 199);

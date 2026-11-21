@@ -7,7 +7,7 @@ Nothing reaches the network until you approve it.
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)
 ![.NET Framework 4.8](https://img.shields.io/badge/.NET%20Framework-4.8-512BD4)
-![Version](https://img.shields.io/badge/version-1.1.0-blue)
+![Version](https://img.shields.io/badge/version-3.0.0-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-2EA44F)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-orange)](LICENSE)
 
@@ -23,23 +23,40 @@ EasyFW doesn't add its own filtering engine or kernel driver. It sets up **Windo
 
 ## Features
 
+**Control**
 - **Blocks by default:** incoming and outgoing traffic is blocked for every app without a rule. Essential DNS and DHCP stay allowed.
-- **Requests you can act on:** each new app shows up once, with its remote IP, ports and protocol.
+- **Requests you can act on:** each new app shows up once, with its remote IP, ports, protocol and whether it's signed. Sort by any column; requests from the LAN are highlighted.
 - **Rules per app:** accept or block an app on all ports, or only on the ones you list, such as `80, 443, 8000-8100`.
+- **For a while:** make a rule last forever, until Windows restarts, or for 10 minutes, 30 minutes or 1 hour.
+- **Hours:** let an app connect only on certain days and times, such as games on weekends from 10:00 to 20:00.
 - **Internet and LAN per app:** keep an accepted app off the internet, off the LAN, or limited to the LAN subnets you tick.
-- **Live connections:** a sortable, filterable list of active and attempted connections, marked accepted or blocked.
-- **Top connections:** the busiest traffic, grouped by app, remote address and port, with accepted and blocked counts.
-- **Host names and countries:** each IP column has a host name next to it, and every remote IP shows its country with a flag.
-- **Traffic graph:** accepted and blocked connections per 10 seconds, over the last 10 minutes.
+- **Path and keyword rules:** accept or block every app in a folder (`C:\Games\*.*`) or with a word in its path. Accept only goes to apps with a valid digital signature.
+- **Lockdown:** one button blocks every app except the ones you choose, and puts everything back when it ends.
+- **Block countries:** cut all traffic with whole countries, for every app.
+- **Blocklists:** block known bad addresses from Spamhaus DROP, FireHOL Level 1, abuse.ch Feodo Tracker and Emerging Threats, updated daily.
+- **Password (optional):** ask for a password before protection is turned off, EasyFW exits, or any rule or option changes.
+
+**See what's happening**
+- **Live connections:** a sortable, filterable list of active and attempted connections, marked accepted or blocked, with host names, countries and flags.
+- **Top connections:** the busiest traffic, grouped by app, remote address and port.
+- **World Map:** a live map of where traffic goes and comes from, with outgoing, incoming and blocked arcs, and a timeline to look back 30 minutes.
+- **Bandwidth:** live data rates for the PC, the internet and the LAN, down and up, for every app, with a graph of the last minutes.
+- **Ports & Shares:** every port this PC listens on, whether the network can reach it, who connected to it, and every shared folder with who is using it.
+- **App log:** right-click any app to see everything it did in the last hour.
+- **Alerts:** a notice when traffic suddenly floods, when someone scans this PC's ports, or when an app tries an address on a blocklist.
+- **Your public IP** beside the status, with its country.
+
+**Upkeep**
 - **Tamper check:** once a minute, EasyFW switches off new allow rules added by installers and re-applies the block defaults if something changed them.
-- **Export and import:** save your rules to a JSON file and load them on another PC.
-- **Copy rows:** right-click any connection or pending request to copy it, ready to paste into a spreadsheet.
-- **Tray icon:** shows status and pending requests, and gives quick access to the main controls.
+- **Automatic updates:** with your agreement, EasyFW installs new releases from GitHub by itself.
+- **Export and import** rules, **copy** any row or path, and arrange the **columns** your way.
 - **Your choice on exit:** put Windows Firewall back the way it was, or keep blocking while EasyFW is closed.
 
-| Decide what each app can do | See the busiest traffic |
+| Decide what each app can do | See where traffic goes |
 |---|---|
-| ![Rules & Requests tab](docs/images/rules.png) | ![Top Connections tab](docs/images/top.png) |
+| ![Rules & Requests tab](docs/images/rules.png) | ![World Map tab](docs/images/map.png) |
+| **Data rates per app, internet and LAN** | **Open ports and shared folders** |
+| ![Bandwidth tab](docs/images/bandwidth.png) | ![Ports & Shares tab](docs/images/ports.png) |
 
 What's new in each version is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -55,7 +72,7 @@ If you lose network access and the app won't help, exit EasyFW and run `EasyFW.e
 
 ## Download
 
-1. Get `EasyFW-1.1.0-windows.zip` from the [latest release](https://github.com/ahmedosama80/EasyFW/releases/latest).
+1. Get `EasyFW-3.0.0-windows.zip` from the [latest release](https://github.com/ahmedosama80/EasyFW/releases/latest).
 2. Unzip it to a folder of its own, keeping the files together. `dbip-country-lite.csv.gz` must stay beside `EasyFW.exe` for the Country column to work.
 3. Run `EasyFW.exe --demo` to try it, then `EasyFW.exe` for real.
 
@@ -93,7 +110,10 @@ Closing the window only hides EasyFW to the tray, and protection stays on. **Exi
 |---|---|
 | Enforcement | Windows Firewall, through the `HNetCfg` COM API |
 | Attempted connections | Security log events 5156 and 5157, watched live |
-| Active connections | `GetExtendedTcpTable` and `GetExtendedUdpTable`, polled every second |
+| Active connections and open ports | `GetExtendedTcpTable` and `GetExtendedUdpTable`, polled every second |
+| Data rates | The `Microsoft-Windows-Kernel-Network` events (ETW), read live in a session named `EasyFW-Network` |
+| Shared folders | WMI: `Win32_Share` and `Win32_ServerConnection` |
+| Signatures | `WinVerifyTrust`, with Windows catalogs, offline |
 
 <details>
 <summary><b>What happens when protection turns on</b></summary>
@@ -133,7 +153,7 @@ Turning protection off reverses all of this using the saved state. It does not t
 <summary><b>How internet and LAN limits work</b></summary>
 
 - An accept rule can turn off **Internet access**, and choose **All LAN**, **Only these subnets** or **No LAN**. Edit a rule to change them.
-- **LAN** means private and link-local addresses (`10.x`, `172.16-31.x`, `192.168.x`, `169.254.x`, IPv6 `fc00::/7` and `fe80::/10`), plus broadcast and multicast so devices can still find each other. **Internet** is every other routable address.
+- **LAN** means the subnets of this PC's connected Ethernet and Wi-Fi adapters (virtual, VPN and Bluetooth adapters don't count), plus link-local addresses (`169.254.x`, `fe80::/10`), broadcast and multicast so devices can still find each other. It follows the network: join another Wi-Fi and the LAN moves with you, and rules with LAN limits are rebuilt. **Internet** is every other routable address, including private addresses reached another way, such as through a VPN.
 - The subnet list shows this PC's connected networks. You can also add any subnet or single address, such as `192.168.1.0/24` or `192.168.1.20`.
 - The limits become remote-address ranges on the app's Windows Firewall rules. EasyFW also closes open connections that fall outside them.
 - Block rules ignore these settings: blocked ports stay blocked for every address.
@@ -146,7 +166,7 @@ Turning protection off reverses all of this using the saved state. It does not t
 
 - Connections by the same app, in the same direction, to the same remote address and destination port count as one group, whatever local port each one used.
 - Each group shows how many times a connection was accepted and blocked in the chosen **Period**: the last 10 minutes, 30 minutes or hour. Periods count whole minutes, including the current one. **Reset counts** starts from zero.
-- Windows doesn't report bytes per connection, so the counts are connections, not data volume.
+- The counts are connections, not data volume. Data volume per app is on the **Bandwidth** tab.
 - Rank by total, blocked or accepted. Right-click a group to accept or block its app.
 
 </details>
@@ -155,16 +175,43 @@ Turning protection off reverses all of this using the saved state. It does not t
 <summary><b>Where host names and countries come from</b></summary>
 
 - **Host names** come from reverse DNS, looked up in the background a few at a time and cached until EasyFW closes. Only addresses on screen are looked up. The lookups go to your usual DNS server through the Windows DNS service. An address with no reverse name stays blank.
-- **Countries** come from the free [DB-IP](https://db-ip.com) "IP to Country Lite" database, which ships beside the exe as `dbip-country-lite.csv.gz`. Lookups happen on this PC, so no address is sent anywhere. Private addresses show **Local network**.
+- **Countries** come from the free [DB-IP](https://db-ip.com) "IP to Country Lite" database, which ships beside the exe as `dbip-country-lite.csv.gz`. Lookups happen on this PC, so no address is sent anywhere. Addresses on your LAN show **Local network**.
 - DB-IP updates the database monthly. To update, download a newer `dbip-country-lite-YYYY-MM.csv.gz`, save it beside `EasyFW.exe` as `dbip-country-lite.csv.gz`, and restart EasyFW.
 - Flags are the public-domain famfamfam icons by Mark James. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 </details>
 
 <details>
+<summary><b>When EasyFW itself goes online</b></summary>
+
+EasyFW blocks everything, itself included, so it has its own rule for these: **its own exe, outgoing, HTTPS (port 443) only**. The rule exists only while one of them is on, and nothing about your PC is sent.
+
+| What | Where | When | Turn off |
+|---|---|---|---|
+| Public IP | `api.ipify.org`, with `checkip.amazonaws.com` and `icanhazip.com` as backups | At start, every 15 minutes, and when the network changes | **Options > Show my public IP** |
+| Updates | `api.github.com` and `github.com` | Once a day, only if you agreed when asked | **Options > Automatic updates from GitHub** |
+| Blocklists | `spamhaus.org`, `github.com`, `abuse.ch`, `emergingthreats.net` | Once a day, only for the lists you ticked | **Options > Blocklists of bad addresses** |
+
+An update is installed only if its size, GitHub's checksum and the version inside the exe all match. If anything fails, the old files go back.
+
+</details>
+
+<details>
+<summary><b>How data rates are measured</b></summary>
+
+- Windows reports every TCP and UDP send and receive with the process and remote address. EasyFW adds them up each second, by app, and splits them into internet and LAN.
+- The figures count the data apps send and receive, not packet headers, so they read a few percent below Task Manager's network figure.
+- This needs administrator rights, which EasyFW always has. If Windows refuses, the Bandwidth tab says why.
+- Your PC talking to itself (loopback) isn't counted.
+
+</details>
+
+<details>
 <summary><b>Where settings are stored</b></summary>
 
-Config is in `%ProgramData%\EasyFW\config.json`. That folder is writable only by administrators, because a program that could edit the file could approve itself.
+Config is in `%ProgramData%\EasyFW\config.json`. That folder is writable only by administrators, because a program that could edit the file could approve itself. Downloaded blocklists are kept in `%ProgramData%\EasyFW\blocklists`.
+
+The password is stored only as a salted hash. If you forget it, delete the `PasswordHash` line from `config.json` as an administrator and restart EasyFW.
 
 Import adds to your rules, and a rule for an app you already have a rule for replaces it. Only rules move, never protection state or the saved Windows Firewall settings.
 
@@ -183,6 +230,9 @@ EasyFW used to be called HomeFW. Exit any old copy first, or EasyFW won't start.
 - **Other firewalls and policies can interfere.** EasyFW refuses to turn on if Group Policy controls Windows Firewall. A security suite with its own firewall may take over from Windows Firewall, and then EasyFW's rules don't apply.
 - **The Security log gets busier.** Event 5156 fires for every allowed connection, so older entries roll off sooner. The previous audit setting comes back when protection is turned off. If the setting's text can't be read, for example on a non-English Windows, it's left as is.
 - **Start at logon runs the exe elevated with no prompt.** Install it under Program Files first, or another program could replace the file. The app warns you if you don't.
+- **Hours and temporary rules switch only while EasyFW runs.** If you exit with protection kept on, rules stay as they were at exit until EasyFW starts again.
+- **The password guards EasyFW's window only.** Someone with administrator rights can still change Windows Firewall directly.
+- **Countries and blocklists are only as good as their data.** A few addresses are placed in the wrong country, and a list can contain a mistake: add an exception if a site you trust is blocked.
 
 ## Project status
 
@@ -200,8 +250,8 @@ dotnet run --project tests/EasyFW.Tests -- --shots shots # renders each screen t
 
 | Folder | Contents |
 |---|---|
-| `src/EasyFW/Core` | Rules, pending requests, connection history, config |
-| `src/EasyFW/Platform` | Windows Firewall COM, audit policy, event log, connection tables, logon task |
+| `src/EasyFW/Core` | Rules, pending requests, connection history, config, countries, blocklists, map and bandwidth logic, updates |
+| `src/EasyFW/Platform` | Windows Firewall COM, audit policy, event log, connection tables, network events (ETW), shares, signatures, logon task |
 | `src/EasyFW/UI` | Tray, main window, tabs, setup wizard |
 | `src/EasyFW/Demo` | The no-op backend and simulated traffic behind `--demo` |
 | `tests/EasyFW.Tests` | Logic tests, the real-API probe and the screenshot renderer |

@@ -28,7 +28,7 @@ namespace EasyFW.Core
         public bool IsLoopback => IpText.IsLoopback(LocalIp) || IpText.IsLoopback(RemoteIp);
     }
 
-    public enum ConnectionColumn { Time, Status, Process, Pid, Direction, Protocol, LocalIp, LocalHost, RemoteIp, RemoteHost, Country, SourcePort, DestPort, State, Hits, Path }
+    public enum ConnectionColumn { Time, Status, Process, Pid, Direction, Protocol, LocalIp, LocalHost, RemoteIp, RemoteHost, Country, SourcePort, DestPort, State, Hits, Path, Signed, Threat }
 
     public sealed class ConnectionFilter
     {
@@ -193,6 +193,21 @@ namespace EasyFW.Core
         public List<ConnectionEntry> Query(ConnectionFilter filter, ConnectionColumn column, bool ascending)
         {
             var list = _entries.Values.Where(e => Matches(e, filter)).ToList();
+            // Text keys are worked out once per row rather than on every comparison, since this runs every second.
+            var textKey = TextKey(column);
+            if (textKey != null)
+            {
+                var keys = new Dictionary<ConnectionEntry, string>(list.Count);
+                foreach (var e in list) keys[e] = textKey(e) ?? "";
+                list.Sort((a, b) =>
+                {
+                    var c = column == ConnectionColumn.LocalIp || column == ConnectionColumn.RemoteIp
+                        ? string.CompareOrdinal(keys[a], keys[b]) : string.Compare(keys[a], keys[b], StringComparison.OrdinalIgnoreCase);
+                    if (!ascending) c = -c;
+                    return c != 0 ? c : string.CompareOrdinal(a.Key, b.Key);
+                });
+                return list;
+            }
             list.Sort((a, b) =>
             {
                 var c = Compare(a, b, column);
@@ -200,6 +215,21 @@ namespace EasyFW.Core
                 return c != 0 ? c : string.CompareOrdinal(a.Key, b.Key);
             });
             return list;
+        }
+
+        private static Func<ConnectionEntry, string> TextKey(ConnectionColumn column)
+        {
+            switch (column)
+            {
+                case ConnectionColumn.LocalIp: return e => IpText.SortKey(e.LocalIp);
+                case ConnectionColumn.RemoteIp: return e => IpText.SortKey(e.RemoteIp);
+                case ConnectionColumn.LocalHost: return e => IpInfo.HostName(e.LocalIp, false);
+                case ConnectionColumn.RemoteHost: return e => IpInfo.HostName(e.RemoteIp, false);
+                case ConnectionColumn.Country: return e => IpInfo.CountryText(e.RemoteIp);
+                case ConnectionColumn.Signed: return e => EasyFW.Platform.AppSignature.Text(e.AppPath);
+                case ConnectionColumn.Threat: return e => BlocklistIndex.Current.Match(e.RemoteIp) ?? "";
+                default: return null;
+            }
         }
 
         private static int Compare(ConnectionEntry a, ConnectionEntry b, ConnectionColumn column)

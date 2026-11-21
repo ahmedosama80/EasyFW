@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -16,6 +17,73 @@ namespace EasyFW.Core
         private const string SvcHost = @"%SystemRoot%\system32\svchost.exe";
 
         public static string Tag(AppRule rule) => $"[{rule.Id}]";
+        public const string CountryTag = "[country]";
+        /// <summary>Windows takes long address lists, but they're split so no single rule gets unwieldy.</summary>
+        public const int RangesPerRule = 1000;
+
+        /// <summary>Local time, swappable for tests.</summary>
+        public static Func<DateTime> LocalNow { get; set; } = () => DateTime.Now;
+
+        /// <summary>The address ranges of a country, for a block rule. Swappable for tests.</summary>
+        public static Func<string, List<string>> CountryRanges { get; set; } = IpInfo.RangesOf;
+
+        /// <summary>
+        /// Whether a rule's Windows rules should exist right now. A plain block rule always applies. A rule that lets traffic through
+        /// pauses outside its hours and, during a lockdown, unless it's marked to keep working.
+        /// </summary>
+        public static bool InEffect(AppRule rule, AppConfig config, DateTime local) =>
+            rule.Enabled && (!rule.Opens || (!config.Lockdown || rule.KeepInLockdown) && rule.InSchedule(local));
+
+        public static IEnumerable<FirewallRuleSpec> ForAppNow(AppRule rule, AppConfig config) =>
+            InEffect(rule, config, LocalNow()) ? ForApp(rule) : Enumerable.Empty<FirewallRuleSpec>();
+
+        /// <summary>Block rules for every address on the chosen blocklists, both ways, for every app.</summary>
+        public static List<FirewallRuleSpec> BlocklistRules(IReadOnlyList<string> entries)
+        {
+            var specs = new List<FirewallRuleSpec>();
+            var parts = (entries.Count + RangesPerRule - 1) / RangesPerRule;
+            for (var i = 0; i < parts; i++)
+            {
+                var chunk = string.Join(",", entries.Skip(i * RangesPerRule).Take(RangesPerRule));
+                foreach (var d in new[] { TrafficDirection.Outbound, TrafficDirection.Inbound })
+                    specs.Add(new FirewallRuleSpec
+                    {
+                        Name = $"EasyFW: blocklist {i + 1}/{parts} {Blocklists.Tag} {(d == TrafficDirection.Outbound ? "Out" : "In")}",
+                        Description = "Blocks known bad addresses from the blocklists chosen in EasyFW, for every app.",
+                        Direction = d,
+                        Allow = false,
+                        RemoteAddresses = chunk
+                    });
+            }
+            return specs;
+        }
+
+        /// <summary>Block rules for every address of each blocked country, both ways, for every app.</summary>
+        public static List<FirewallRuleSpec> CountryRules(AppConfig config)
+        {
+            var specs = new List<FirewallRuleSpec>();
+            foreach (var code in config.BlockedCountries ?? new List<string>())
+            {
+                var ranges = CountryRanges(code) ?? new List<string>();
+                var parts = (ranges.Count + RangesPerRule - 1) / RangesPerRule;
+                for (var i = 0; i < parts; i++)
+                {
+                    var chunk = string.Join(",", ranges.Skip(i * RangesPerRule).Take(RangesPerRule));
+                    foreach (var d in new[] { TrafficDirection.Outbound, TrafficDirection.Inbound })
+                    {
+                        specs.Add(new FirewallRuleSpec
+                        {
+                            Name = $"EasyFW: block country {code} {i + 1}/{parts} {CountryTag} {(d == TrafficDirection.Outbound ? "Out" : "In")}",
+                            Description = $"Blocks all traffic with {IpInfo.CountryName(code)}, for every app.",
+                            Direction = d,
+                            Allow = false,
+                            RemoteAddresses = chunk
+                        });
+                    }
+                }
+            }
+            return specs;
+        }
 
         public static IEnumerable<FirewallRuleSpec> ForApp(AppRule rule)
         {
@@ -115,10 +183,26 @@ namespace EasyFW.Core
             return list;
         }
 
+        /// <summary>EasyFW's own exe, set at startup. Null in tests.</summary>
+        public static string SelfPath { get; set; }
+
+        /// <summary>Lets EasyFW itself check its public IP and its updates: its own exe, outgoing, HTTPS only.</summary>
+        public static FirewallRuleSpec PublicIpLookup(string exe) => new FirewallRuleSpec
+        {
+            Name = $"EasyFW: public IP and updates {EssentialTag}",
+            Description = "Lets EasyFW show this PC's public IP and check GitHub for updates. Turn both off in Options to remove it.",
+            AppPath = exe,
+            Direction = TrafficDirection.Outbound,
+            Allow = true,
+            Protocol = FirewallProtocols.Tcp,
+            RemotePorts = "443"
+        };
+
         public static List<FirewallRuleSpec> All(AppConfig config)
         {
             var specs = config.AllowEssentials ? Essentials() : new List<FirewallRuleSpec>();
-            specs.AddRange(config.Rules.SelectMany(ForApp));
+            if (config.NeedsOwnConnection && !string.IsNullOrEmpty(SelfPath)) specs.Add(PublicIpLookup(SelfPath));
+            specs.AddRange(config.Rules.SelectMany(r => ForAppNow(r, config)));
             return specs;
         }
 

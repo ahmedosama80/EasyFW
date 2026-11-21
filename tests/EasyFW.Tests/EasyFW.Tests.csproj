@@ -11,5 +11,7 @@
     <ProjectReference Include="..\..\src\EasyFW\EasyFW.csproj" />
     <Reference Include="Microsoft.CSharp" />
     <Reference Include="System.Runtime.Serialization" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
 </Project>

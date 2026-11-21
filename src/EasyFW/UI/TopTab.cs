@@ -29,11 +29,12 @@ namespace EasyFW.UI
             ("Blocked", 64, HorizontalAlignment.Right),
             ("First seen", 76, HorizontalAlignment.Left),
             ("Last seen", 76, HorizontalAlignment.Left),
+            ("Signed", 150, HorizontalAlignment.Left),
             ("Path", 320, HorizontalAlignment.Left)
         };
 
         private readonly FirewallService _service;
-        private readonly Func<string, RuleAction, string, Task> _decide;
+        private readonly DecideHandler _decide;
         private readonly ListView _list = new ListView
         {
             Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, VirtualMode = true, HideSelection = false, BorderStyle = BorderStyle.None
@@ -52,6 +53,7 @@ namespace EasyFW.UI
         private readonly Button _reset =new Button { Text = "Reset counts", AutoSize = true, Margin = new Padding(0, 3, 4, 3) };
         private readonly ToolStripMenuItem _acceptItem = new ToolStripMenuItem("Accept Always");
         private readonly ToolStripMenuItem _blockItem = new ToolStripMenuItem("Block Always");
+        private ToolStripMenuItem _acceptForItem, _blockForItem;
         private readonly ToolStripMenuItem _copyItem = new ToolStripMenuItem("Copy row");
         private List<FlowStat> _rows = new List<FlowStat>();
         private long _shownVersion = -1;
@@ -59,7 +61,7 @@ namespace EasyFW.UI
 
         public string Summary { get; private set; } = "";
 
-        public TopTab(FirewallService service, Func<string, RuleAction, string, Task> decide)
+        public TopTab(FirewallService service, DecideHandler decide)
         {
             _service = service;
             _decide = decide;
@@ -69,6 +71,8 @@ namespace EasyFW.UI
             _list.RetrieveVirtualItem += OnRetrieveItem;
             _list.ContextMenuStrip = BuildMenu();
             Flags.ShowInColumn(_list, 6, 4, i => i < _rows.Count && _rows[i].Accepted == 0 ? Theme.BlockedRow : (System.Drawing.Color?)null);
+            UiHelpers.ShowFullTextOnHover(_list);
+            UiHelpers.RememberColumns(_list, "top", _service);
 
             var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(4, 4, 4, 0), WrapContents = true };
             bar.Controls.Add(UiHelpers.BarLabel("Period"));
@@ -120,18 +124,30 @@ namespace EasyFW.UI
         private ContextMenuStrip BuildMenu()
         {
             var menu = new ContextMenuStrip();
+            _acceptForItem = UiHelpers.ForAWhileMenu(RuleAction.Allow, d => DecideSelected(RuleAction.Allow, d));
+            _blockForItem = UiHelpers.ForAWhileMenu(RuleAction.Block, d => DecideSelected(RuleAction.Block, d));
             _acceptItem.Click += async (_, __) => await DecideSelected(RuleAction.Allow);
             _blockItem.Click += async (_, __) => await DecideSelected(RuleAction.Block);
             menu.Items.Add(_acceptItem);
+            menu.Items.Add(_acceptForItem);
             menu.Items.Add(_blockItem);
+            menu.Items.Add(_blockForItem);
             menu.Items.Add(new ToolStripSeparator());
             _copyItem.Click += (_, __) => UiHelpers.CopyRows(FindForm(), SelectedIndices().Select(i => Cells(_rows[i], i)));
             menu.Items.Add(_copyItem);
+            var copyPath = UiHelpers.CopyPathItem(FindForm, () => SelectedIndices().Select(i => _rows[i].AppPath));
+            menu.Items.Add(copyPath);
             menu.Items.Add("Open file location", null, (_, __) => OpenLocation());
+            menu.Items.Add("Show log (last hour)", null, (_, __) =>
+            {
+                var row = Selected;
+                if (row != null) AppLogForm.Open(FindForm(), _service, AppPaths.RuleTarget(row.AppPath, row.Protocol));
+            });
             menu.Opening += (_, e) =>
             {
                 if (_list.SelectedIndices.Count == 0) e.Cancel = true;
                 _copyItem.Text = UiHelpers.CopyLabel(_list.SelectedIndices.Count);
+                copyPath.Text = UiHelpers.CopyPathLabel(_list.SelectedIndices.Count);
             };
             return menu;
         }
@@ -140,16 +156,17 @@ namespace EasyFW.UI
         {
             _acceptItem.Enabled = can;
             _blockItem.Enabled = can;
+            if (_acceptForItem != null) _acceptForItem.Enabled = _blockForItem.Enabled = can;
         }
 
         private IEnumerable<int> SelectedIndices() => _list.SelectedIndices.Cast<int>().Where(i => i < _rows.Count);
 
         private FlowStat Selected => SelectedIndices().Select(i => _rows[i]).FirstOrDefault();
 
-        private async Task DecideSelected(RuleAction action)
+        private async Task DecideSelected(RuleAction action, RuleDuration duration = RuleDuration.Forever)
         {
             var row = Selected;
-            if (row != null && !string.IsNullOrEmpty(row.AppPath)) await _decide(AppPaths.RuleTarget(row.AppPath, row.Protocol), action, null);
+            if (row != null && !string.IsNullOrEmpty(row.AppPath)) await _decide(AppPaths.RuleTarget(row.AppPath, row.Protocol), action, null, duration);
         }
 
         private void OpenLocation()
@@ -177,9 +194,9 @@ namespace EasyFW.UI
         {
             var flows = _service.Connections.Flows;
             var now = DateTime.UtcNow;
-            if (IpInfo.Version != _infoVersion)
+            if (IpInfo.Version + EasyFW.Platform.AppSignature.Version != _infoVersion)
             {
-                _infoVersion = IpInfo.Version;
+                _infoVersion = IpInfo.Version + EasyFW.Platform.AppSignature.Version;
                 _list.Invalidate();
             }
             // A new minute moves the period along, so old counts drop out even with no new traffic.
@@ -193,16 +210,8 @@ namespace EasyFW.UI
             var period = Periods[Math.Max(0, _period.SelectedIndex)];
             var selected = new HashSet<string>(SelectedIndices().Select(i => _rows[i].Key));
             _rows = flows.Top(CurrentFilter(), (FlowRank)_rank.SelectedIndex, period.Minutes, Limit, now, out var matching);
-            _list.BeginUpdate();
-            try
-            {
-                _list.SelectedIndices.Clear();
-                _list.VirtualListSize = _rows.Count;
-                for (var i = 0; i < _rows.Count && selected.Count > 0; i++)
-                    if (selected.Contains(_rows[i].Key)) _list.SelectedIndices.Add(i);
-            }
-            finally { _list.EndUpdate(); }
-            _list.Invalidate();
+            UiHelpers.ResetVirtual(_list, _rows.Count,
+                selected.Count == 0 ? Enumerable.Empty<int>() : Enumerable.Range(0, _rows.Count).Where(i => selected.Contains(_rows[i].Key)));
 
             var span = period.Minutes == 60 ? "the last hour" : $"the last {period.Minutes} minutes";
             Summary = matching > _rows.Count
@@ -226,6 +235,7 @@ namespace EasyFW.UI
             f.Blocked.ToString(),
             f.FirstSeenUtc.ToLocalTime().ToString("HH:mm:ss"),
             f.LastSeenUtc.ToLocalTime().ToString("HH:mm:ss"),
+            EasyFW.Platform.AppSignature.Text(f.AppPath),
             f.AppPath ?? ""
         };
 
